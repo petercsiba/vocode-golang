@@ -3,13 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"github.com/joho/godotenv"
-	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 type Choice struct {
@@ -29,10 +30,14 @@ type EventData struct {
 // Based off their Python version of the code https://cookbook.openai.com/examples/how_to_stream_completions
 // Translated with GPT-4: https://chat.openai.com/c/c723eeaa-2c24-42c2-aabb-0f5582d0f031
 func main() {
+	// Initialize zerolog with console writer.
+	output := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
+	log.Logger = zerolog.New(output).With().Timestamp().Logger()
+
 	// Load the .env file
 	err := godotenv.Load()
 	if err != nil {
-		log.Println("Cannot load .env file")
+		log.Warn().Msgf("Cannot load .env file")
 	}
 	openAIAPIKey := os.Getenv("OPEN_AI_API_KEY")
 
@@ -67,7 +72,7 @@ func main() {
 	for !isDone {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println("Error reading stream:", err)
+			log.Error().Msgf("Error reading stream:", err)
 			break
 		}
 
@@ -79,7 +84,7 @@ func main() {
 		// Handle event field (this seems to NOT happen)
 		if strings.HasPrefix(line, "event:") {
 			eventType := strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			fmt.Println("Event type:", eventType)
+			log.Info().Msgf("Event type:", eventType)
 			continue
 		}
 
@@ -89,7 +94,7 @@ func main() {
 			dataJSON := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			var eventData EventData
 			if err := json.Unmarshal([]byte(dataJSON), &eventData); err != nil {
-				log.Println("Error unmarshaling data:", err)
+				log.Error().Msgf("Error unmarshaling data:", err)
 				continue
 			}
 
@@ -98,25 +103,25 @@ func main() {
 				if content, ok := choice.Delta["content"]; ok {
 					contentStr, ok := content.(string)
 					if !ok {
-						log.Println("Content is not a string")
+						log.Error().Msgf("Content is not a string %+v", content)
 						continue
 					}
 					contentBuilder.WriteString(contentStr)
 				}
 				if choice.FinishReason != nil {
-					fmt.Println("Response reading finished with " + *choice.FinishReason)
+					log.Info().Msgf("Response reading finished with " + *choice.FinishReason)
 					isDone = true
 				}
 			}
 
 			chunkTime := time.Since(startTime)
-			fmt.Printf("Data received %.2f seconds after request: %+v\n", chunkTime.Seconds(), eventData)
+			log.Info().Msgf("Data received %.2f seconds after request: %+v", chunkTime.Seconds(), eventData)
 			continue
 		}
 
-		fmt.Printf("unhandled line: `" + line + "`")
+		log.Warn().Msgf("unhandled line: `%s`", line)
 	}
 
-	log.Printf("Full response received %.2f seconds after request\n", time.Since(startTime).Seconds())
-	fmt.Printf("Full conversation received: %s\n", contentBuilder.String())
+	log.Info().Msgf("Full response received %.2f seconds after request", time.Since(startTime).Seconds())
+	log.Info().Msgf("Full conversation received: %s", contentBuilder.String())
 }
