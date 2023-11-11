@@ -99,22 +99,34 @@ func malgoRecord() (result []byte, err error) {
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Duplex)
 	deviceConfig.Capture.Format = malgo.FormatS16
 	deviceConfig.Capture.Channels = MyDeviceInputChannels
-	//deviceConfig.Playback.Format = malgo.FormatS16
-	//deviceConfig.Playback.Channels = 1
-	deviceConfig.SampleRate = MyDeviceSampleRate
+	deviceConfig.SampleRate = MyDeviceSampleRate // TODO: maybe doing lower would fasten transcription up?
 	deviceConfig.Alsa.NoMMap = 1
 
-	// var playbackSampleCount uint32
-	var capturedSampleCount uint32
-	pCapturedSamples := make([]byte, 0)
+	sizeInBytes := uint32(malgo.SampleSizeInBytes(deviceConfig.Capture.Format))
+	if sizeInBytes != 2 {
+		log.Fatal().Uint32("size_in_bytes", sizeInBytes).Msgf("Expected 2 bytes for sample %s", deviceConfig.Capture.Format)
+	}
+
+	intData := make([]int, 0)
+	pSampleData := make([]byte, 0)
 
 	// Some black-magic event-handling which I don't really understand.
-	sizeInBytes := uint32(malgo.SampleSizeInBytes(deviceConfig.Capture.Format))
+	// https://github.com/gen2brain/malgo/blob/master/_examples/capture/capture.go
 	onRecvFrames := func(pSample2, pSample []byte, framecount uint32) {
-		sampleCount := framecount * deviceConfig.Capture.Channels * sizeInBytes
-		newCapturedSampleCount := capturedSampleCount + sampleCount
-		pCapturedSamples = append(pCapturedSamples, pSample...)
-		capturedSampleCount = newCapturedSampleCount
+		// sampleCount := framecount * deviceConfig.Capture.Channels * sizeInBytes
+
+		// Empirically, len(pSample) is 480, so for sample rate 44100 it's triggered about every 10ms.
+		intDataDelta := make([]int, len(pSample)/2)
+		for i := 0; i < len(pSample); i += 2 {
+			// Convert the pCapturedSamples byte slice to int16 slice for FormatS16 as we go
+			value := int(binary.LittleEndian.Uint16(pSample[i : i+2]))
+			intDataDelta[i/2] = value
+		}
+		intData = append(intData, intDataDelta...)
+		pSampleData = append(pSampleData, pSample...)
+
+		// For now just better understand this, later we can do a Poor mens VAP to detect silence.
+		// TODO(P1, ux): See how vocode or WebRTC VAP does that
 	}
 
 	captureCallbacks := malgo.DeviceCallbacks{
@@ -143,12 +155,6 @@ func malgoRecord() (result []byte, err error) {
 	timeStop := time.Now()
 
 	device.Uninit()
-
-	// Convert byte slice to int16 slice for FormatS16
-	intData := make([]int, len(pCapturedSamples)/2)
-	for i := 0; i < len(pCapturedSamples); i += 2 {
-		intData[i/2] = int(binary.LittleEndian.Uint16(pCapturedSamples[i : i+2]))
-	}
 
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
