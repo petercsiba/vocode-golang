@@ -139,6 +139,8 @@ func malgoRecord() (result []byte, err error) {
 	_, err = fmt.Scanln()
 	dbg(err)
 	log.Debug().Dur("recording_duration", time.Since(timeStart)).Msg("malgo stop recording")
+	log.Warn().Msg("TRACING HACK: malgo stop recording")
+	timeStop := time.Now()
 
 	device.Uninit()
 
@@ -151,6 +153,7 @@ func malgoRecord() (result []byte, err error) {
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
 	result, err = convertBytesToWav(intData, int(deviceConfig.SampleRate), int(deviceConfig.Capture.Channels))
+	log.Warn().Dur("latency", time.Since(timeStop)).Msg("TRACING HACK: convert bytes to raw")
 	return
 }
 

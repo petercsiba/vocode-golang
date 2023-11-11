@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -23,7 +22,7 @@ import (
 
 // MinTextBufferForTtsCharLength is a tradeoff between API call latency and jitter from missing TTSed chunks.
 // This also correlates with "human breathing" in the output intonation.
-const MinTextBufferForTtsCharLength = 20
+const MinTextBufferForTtsCharLength = 10
 
 // OpenAiSampleRate - this I have measured by decodedMp3.SampleRate
 const OpenAiSampleRate = 24000
@@ -58,8 +57,13 @@ func executeChatRequest(client *openai.Client, prompt string, outputChan chan st
 	var contentBuilder strings.Builder
 	var debugChunkBuilder strings.Builder
 
+	firstContent := true
 	for {
 		response, streamRecvErr := completionStream.Recv()
+		if firstContent {
+			log.Warn().Dur("latency", time.Since(startTime)).Msg("TRACING HACK: first chat completion received")
+			firstContent = false
+		}
 
 		// Process the response
 		for _, choice := range response.Choices {
@@ -93,7 +97,7 @@ func executeChatRequest(client *openai.Client, prompt string, outputChan chan st
 }
 
 // This is to by-pass not-yet-implemented APIs in go-openai
-func sendRequest(openAIAPIKey string, method string, endpoint string, requestStr string) (reader *bufio.Reader, doLater func(), err error) {
+func sendRequest(openAIAPIKey string, method string, endpoint string, requestStr string) (result []byte, err error) {
 	requestStart := time.Now()
 	// Construct the request body
 	reqBody := strings.NewReader(requestStr)
@@ -111,7 +115,7 @@ func sendRequest(openAIAPIKey string, method string, endpoint string, requestStr
 	if err != nil {
 		return
 	}
-	doLater = func() { resp.Body.Close() }
+	defer func() { resp.Body.Close() }()
 
 	log.Debug().Dur("request_time", time.Since(requestStart)).Str("method", method).Str("endpoint", endpoint).Int("status_code", resp.StatusCode).Msg("request done")
 
@@ -122,7 +126,13 @@ func sendRequest(openAIAPIKey string, method string, endpoint string, requestStr
 		return
 	}
 
-	reader = bufio.NewReader(resp.Body)
+	readStart := time.Now()
+	result, err = io.ReadAll(resp.Body)
+	log.Debug().Dur("response_body_read_time", time.Since(readStart)).Int("response_byte_size", len(result)).Str("endpoint", endpoint).Msg("request body read done")
+	if err != nil {
+		err = fmt.Errorf("could not read response %w", err)
+		return
+	}
 	return
 }
 
@@ -148,19 +158,11 @@ func sendTTSRequest(openAIAPIKey string, input string) (rawAudioBytes []byte, er
 		Speed:          1.0,
 	}
 	reqStr, _ := json.Marshal(payload)
-	reader, doLater, err := sendRequest(openAIAPIKey, "POST", "audio/speech", string(reqStr))
+	rawAudioBytes, err = sendRequest(openAIAPIKey, "POST", "audio/speech", string(reqStr))
 	if err != nil {
 		err = fmt.Errorf("could not do audio/speech for %s cause %w", reqStr, err)
 		return
 	}
-	defer doLater()
-
-	rawAudioBytes, err = io.ReadAll(reader)
-	if err != nil {
-		err = fmt.Errorf("could not read response %w", err)
-		return
-	}
-	log.Debug().Int("output_bytes", len(rawAudioBytes)).Msg("sendTTSRequest success")
 	return
 }
 
@@ -181,6 +183,7 @@ func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, raw
 	log.Info().Msgf("textToSpeechAndEncodeRoutine started")
 	var buffer string
 
+	firstEligibleBuffer := true
 	for {
 		select {
 		case text, ok := <-textCh:
@@ -189,6 +192,10 @@ func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, raw
 			}
 			// log.Trace().Str("text", text).Bool("ok", ok).Str("buffer", buffer).Msg("text received")
 			if (len(buffer) > MinTextBufferForTtsCharLength && isPunctuationMarkAtEnd(buffer)) || (!ok && buffer != "") {
+				if firstEligibleBuffer {
+					log.Warn().Msg("TRACING HACK: first eligible buffer triggered")
+					firstEligibleBuffer = false
+				}
 				// Process the buffer
 				rawAudioBytes, err := sendTTSRequest(openAIAPIKey, buffer)
 				if err == nil {
@@ -230,6 +237,9 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 	i := 0
 	for rawAudioBytes := range rawAudioBytesCh {
 		i += 1
+		if i == 1 {
+			log.Warn().Msg("TRACING HACK: first tts received")
+		}
 
 		log.Debug().Msgf("attempting to play %d bytes of mp3", len(rawAudioBytes))
 		startTime := time.Now()
@@ -249,6 +259,9 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 		log.Trace().Int("sample_rate", decodedMp3.SampleRate()).Int64("byte_size", decodedMp3.Length()).Msg("player START")
 		player := otoCtx.NewPlayer(decodedMp3) // Sub-millisecond time
 		player.Play()
+		if i == 1 {
+			log.Warn().Msg("TRACING HACK: first playback started")
+		}
 
 		// Wait for the chunk to finish playing
 		for player.IsPlaying() {
@@ -264,13 +277,16 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 	}
 }
 
+// TODO(P1, latency): Figure out by how much mp3 is faster than .WAV
+//
+//	3 tests on a 260KB wav vs 67KB mp3 it seems maybe 1100ms vs 1000ms, but there was a run when wav beat mp3 :/
 func transcribeAudio(client *openai.Client, input io.Reader, fileExtension string) (result string, err error) {
 	startTime := time.Now()
 	req := openai.AudioRequest{
 		Model:    "whisper-1",
 		Reader:   input,
 		FilePath: fmt.Sprintf("this-file-does-not-exist-just-needs-extension.%s", fileExtension),
-		//FilePath: "output/recording.wav",
+		// FilePath: "output/tell-me-about-ba.mp3",
 		//Prompt:      "some previous words",  // TODO
 	}
 	resp, err := client.CreateTranscription(context.Background(), req)
@@ -278,6 +294,7 @@ func transcribeAudio(client *openai.Client, input io.Reader, fileExtension strin
 		err = fmt.Errorf("cannot create transcription %w", err)
 		return
 	}
+	log.Warn().Dur("transcription_time", time.Since(startTime)).Msg("TRACING HACK: create transcription done")
 
 	//var contentBuilder strings.Builder
 	//for _, segment := range resp.Segments {
@@ -293,6 +310,7 @@ func transcribeAudio(client *openai.Client, input io.Reader, fileExtension strin
 // Translated with GPT-4: https://chat.openai.com/c/c723eeaa-2c24-42c2-aabb-0f5582d0f031
 // Using https://github.com/sashabaranov/go-openai/blob/d6f3bdcdac9172ab5248d6be8c3e1761446a434c/chat_stream.go#L62
 func main() {
+	setupStart := time.Now()
 	// Set up zerolog with custom output to include milliseconds in the timestamp
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{
 		Out:        os.Stdout,
@@ -312,6 +330,9 @@ func main() {
 	}
 	client := openai.NewClient(openAIAPIKey)
 
+	// About 200ms
+	otoCtx := setupOtoContext(OpenAiSampleRate, 2)
+	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
 	// ==== SETUP DONE
 
 	recordingBytes, err := malgoRecord()
@@ -326,8 +347,6 @@ func main() {
 		return
 	}
 	log.Info().Str("transcript", transcript).Msg("transcript received")
-
-	otoCtx := setupOtoContext(OpenAiSampleRate, 2)
 
 	// Documentation for the routines intent / design:
 	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
