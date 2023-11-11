@@ -1,1 +1,1 @@
-# vocode-golang
+# Setup for Local (MacOS)

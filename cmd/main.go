@@ -150,14 +150,14 @@ func sendTTSRequest(openAIAPIKey string, input string) (rawAudioBytes []byte, er
 	reqStr, _ := json.Marshal(payload)
 	reader, doLater, err := sendRequest(openAIAPIKey, "POST", "audio/speech", string(reqStr))
 	if err != nil {
-		err = fmt.Errorf("could not do audio/speech for %s cause %v", reqStr, err)
+		err = fmt.Errorf("could not do audio/speech for %s cause %w", reqStr, err)
 		return
 	}
 	defer doLater()
 
 	rawAudioBytes, err = io.ReadAll(reader)
 	if err != nil {
-		err = fmt.Errorf("could not read response cause %v", err)
+		err = fmt.Errorf("could not read response %w", err)
 		return
 	}
 	log.Debug().Int("output_bytes", len(rawAudioBytes)).Msg("sendTTSRequest success")
@@ -264,6 +264,31 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 	}
 }
 
+func transcribeAudio(client *openai.Client, input io.Reader, fileExtension string) (result string, err error) {
+	startTime := time.Now()
+	req := openai.AudioRequest{
+		Model:    "whisper-1",
+		Reader:   input,
+		FilePath: fmt.Sprintf("this-file-does-not-exist-just-needs-extension.%s", fileExtension),
+		//FilePath: "output/recording.wav",
+		//Prompt:      "some previous words",  // TODO
+	}
+	resp, err := client.CreateTranscription(context.Background(), req)
+	if err != nil {
+		err = fmt.Errorf("cannot create transcription %w", err)
+		return
+	}
+
+	//var contentBuilder strings.Builder
+	//for _, segment := range resp.Segments {
+	//	contentBuilder.WriteString(segment.Text)
+	//}
+	//result = contentBuilder.String()
+	result = resp.Text
+	log.Debug().Str("transcription", result).Dur("time_elapsed", time.Since(startTime)).Msg("received transcription")
+	return
+}
+
 // Based off their Python version of the code https://cookbook.openai.com/examples/how_to_stream_completions
 // Translated with GPT-4: https://chat.openai.com/c/c723eeaa-2c24-42c2-aabb-0f5582d0f031
 // Using https://github.com/sashabaranov/go-openai/blob/d6f3bdcdac9172ab5248d6be8c3e1761446a434c/chat_stream.go#L62
@@ -287,6 +312,21 @@ func main() {
 	}
 	client := openai.NewClient(openAIAPIKey)
 
+	// ==== SETUP DONE
+
+	recordingBytes, err := malgoRecord()
+	if err != nil {
+		log.Error().Err(err).Msg("malgo record failed")
+		return
+	}
+
+	transcript, err := transcribeAudio(client, bytes.NewReader(recordingBytes), "wav")
+	if err != nil {
+		log.Error().Err(err).Msg("cannot transcribe audio")
+		return
+	}
+	log.Info().Str("transcript", transcript).Msg("transcript received")
+
 	otoCtx := setupOtoContext(OpenAiSampleRate, 2)
 
 	// Documentation for the routines intent / design:
@@ -296,9 +336,10 @@ func main() {
 	go textToSpeechAndEncodeRoutine(openAIAPIKey, chatOutputChan, rawAudioBytesChan)
 	go playAudioChunksRoutine(otoCtx, rawAudioBytesChan)
 
-	// SETUP DONE
-	// TODO: change to user input from the shell
-	prompt := "Tell me about Bratislava in 100 words"
+	prompt := transcript
+	// prompt := "Strep throat recovery timeline in 100 words"
+	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
+	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
 	executeChatRequest(client, prompt, chatOutputChan)
 
 	// TODO: Better wait mechanism.
