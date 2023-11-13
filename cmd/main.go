@@ -30,14 +30,14 @@ const OpenAiSampleRate = 24000
 
 var httpClient = &http.Client{}
 
-func executeChatRequest(client *openai.Client, prompt string, outputChan chan string) {
+func executeChatRequest(client *openai.Client, model string, prompt string, outputChan chan string) {
 	startTime := time.Now()
 	lastDataReceivedPrintoutTime := time.Now()
 
 	// Create a chat completion request
 	chatRequest := openai.ChatCompletionRequest{
 		// Model: "gpt-3.5-turbo",
-		Model: "gpt-4",
+		Model: model,
 		Messages: []openai.ChatCompletionMessage{
 			{
 				Role:    "user",
@@ -83,7 +83,6 @@ func executeChatRequest(client *openai.Client, prompt string, outputChan chan st
 
 		// We only handle the error at the end - since we can get io.EOF with the last token.
 		if streamRecvErr != nil {
-			close(outputChan)
 			if errors.Is(streamRecvErr, io.EOF) {
 				break // Stream closed, exit loop
 			}
@@ -92,6 +91,7 @@ func executeChatRequest(client *openai.Client, prompt string, outputChan chan st
 		}
 	}
 
+	close(outputChan)
 	result := contentBuilder.String()
 	log.Info().Msgf("Full response received %.2f seconds after request", time.Since(startTime).Seconds())
 	log.Info().Msgf("Full conversation received: %s", result)
@@ -148,15 +148,15 @@ type TTSPayload struct {
 
 // TODO(devx, P1): Replace with the official one after implemented
 // https://github.com/sashabaranov/go-openai/pull/528/files?diff=unified&w=0
-func sendTTSRequest(openAIAPIKey string, input string) (rawAudioBytes []byte, err error) {
-	log.Debug().Str("input", input).Msg("sendTTSRequest start")
+func sendTTSRequest(openAIAPIKey string, input string, speed float64) (rawAudioBytes []byte, err error) {
+	log.Debug().Str("input", input).Float64("speed", speed).Msg("sendTTSRequest start")
 
 	payload := TTSPayload{
 		Model:          "tts-1",
 		Input:          input,
-		Voice:          "alloy",
+		Voice:          "echo",
 		ResponseFormat: "mp3", // TODO(ux, P1): Opus should be a better format for streaming, using mp3 for ease.
-		Speed:          1.0,
+		Speed:          speed,
 	}
 	reqStr, _ := json.Marshal(payload)
 	rawAudioBytes, err = sendRequest(openAIAPIKey, "POST", "audio/speech", string(reqStr))
@@ -197,8 +197,9 @@ func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, raw
 					log.Warn().Msg("TRACING HACK: first eligible buffer triggered")
 					firstEligibleBuffer = false
 				}
-				// Process the buffer
-				rawAudioBytes, err := sendTTSRequest(openAIAPIKey, buffer)
+				// Process the buffer;
+				// Speed 1.15 was reverse engineered from the ChatGPT app
+				rawAudioBytes, err := sendTTSRequest(openAIAPIKey, buffer, 1.15)
 				if err == nil {
 					rawAudioBytesCh <- rawAudioBytes
 				} else {
@@ -333,8 +334,11 @@ func transcribeAudio(client *openai.Client, input io.Reader, fileExtension strin
 	return
 }
 
-func transcribeAudioRoutine(client *openai.Client, wavChunksChan chan []byte, finalTranscriptChan chan string) {
+func transcribeAudioRoutine(client *openai.Client, wavChunksChan chan []byte, finalTranscriptChan chan string, earlyTranscriptChan chan string) {
 	log.Info().Msgf("transcribeAudioRoutine started")
+	routineStart := time.Now()
+	sendEarlyTranscript := true
+
 	// Replace 'client' and 'transcribeAudio' with your actual client and function
 	var transcriptBuilder strings.Builder
 	for recordingBytes := range wavChunksChan {
@@ -345,6 +349,12 @@ func transcribeAudioRoutine(client *openai.Client, wavChunksChan chan []byte, fi
 			continue
 		}
 		transcriptBuilder.WriteString(transcript + " ")
+
+		if sendEarlyTranscript && time.Since(routineStart).Seconds() > 7 {
+			sendEarlyTranscript = false
+			log.Info().Msgf("transcribeAudioRoutine sending earlyTranscript")
+			earlyTranscriptChan <- transcriptBuilder.String()
+		}
 	}
 
 	finalTranscript := transcriptBuilder.String()
@@ -356,6 +366,41 @@ func compareToFullTranscript(client *openai.Client, wavBytes []byte, finalTransc
 	fullResult, err := transcribeAudio(client, bytes.NewReader(wavBytes), "wav", "")
 	dbg(err)
 	log.Info().Str("full_transcript", fullResult).Str("sliced_together_transcript", finalTranscriptFromSlices).Msg("comparing full transcript to from slices")
+}
+
+func fillerWordRoutine(client *openai.Client, openAIAPIKey string, earlyTranscriptChan chan string, audioOutputChan chan []byte) {
+	log.Info().Msgf("fillerWordRoutine START")
+	// This is the 5-10
+	earlyTranscript := <-earlyTranscriptChan
+	log.Info().Msgf("fillerWordRoutine received earlyTranscript %s", earlyTranscript)
+
+	//prompt := fmt.Sprintf("I want to respond to this input text with a few filler words; example 1: Hm, San Francisco... Example 2: Alright, your fathers birthday... Input text: %s", earlyTranscript)
+	//prompt := fmt.Sprintf("Generate a few filler words with mentioning the topic to be used while i am thinking. Only output the filler words, up to 5 words. The input text: %s", earlyTranscript)
+	fillerPrompt := fmt.Sprintf("generate the most appropriate filler word to this transcript, only output a single word: %s", earlyTranscript)
+	fillerPromptResult := make(chan string, 1000)
+	go executeChatRequest(client, "gpt-3.5-turbo", fillerPrompt, fillerPromptResult)
+	// go executeChatRequest(client, "gpt-4", prompt, promptResult)
+	fillerWords := "..."
+	for token := range fillerPromptResult {
+		fillerWords += token
+	}
+
+	topicPrompt := fmt.Sprintf("etract conversation title in 1-4 words from this transcript: %s", earlyTranscript)
+	topicPromptResult := make(chan string, 1000)
+	go executeChatRequest(client, "gpt-3.5-turbo", topicPrompt, topicPromptResult)
+	for token := range topicPromptResult {
+		fillerWords += token
+	}
+
+	// Speed 1.0, filler words are more natural to produce slow.
+	fillerWordAudioBytes, err := sendTTSRequest(openAIAPIKey, fillerWords, 1.0)
+	if err == nil {
+		log.Info().Msgf("generating filler words %s", fillerWords)
+		audioOutputChan <- fillerWordAudioBytes
+	} else {
+		log.Error().Err(err).Msg("cannot generate filler words")
+	}
+	log.Info().Msgf("fillerWordRoutine END")
 }
 
 // Based off their Python version of the code https://cookbook.openai.com/examples/how_to_stream_completions
@@ -389,7 +434,11 @@ func main() {
 
 	wavChunksChan := make(chan []byte, 100000)
 	finalTranscriptChan := make(chan string, 1)
-	go transcribeAudioRoutine(client, wavChunksChan, finalTranscriptChan)
+	earlyTranscriptChan := make(chan string, 1)
+	chatOutputChan := make(chan string, 100000)
+	rawAudioBytesChan := make(chan []byte, 100000)
+	go transcribeAudioRoutine(client, wavChunksChan, finalTranscriptChan, earlyTranscriptChan)
+	go fillerWordRoutine(client, openAIAPIKey, earlyTranscriptChan, rawAudioBytesChan)
 
 	recordingBytesForDebug, err := malgoRecord(wavChunksChan)
 	if err != nil {
@@ -401,28 +450,15 @@ func main() {
 
 	// Documentation for the chat and rawAudio routines intent / design:
 	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
-	chatOutputChan := make(chan string, 100000)
-	rawAudioBytesChan := make(chan []byte, 100000)
 	go textToSpeechAndEncodeRoutine(openAIAPIKey, chatOutputChan, rawAudioBytesChan)
 	go playAudioChunksRoutine(otoCtx, rawAudioBytesChan)
-
-	// TODO: Kinda HACK: Put a filler word before all transcripts are done (usually a 1s delay)
-	// -- although I feel like ChatCompletion already does this.
-	// IDEALLY, we can send a 3.5-turbo request for "generate up to 3 filler words for thinking about response to [first 10 words of transcript]
-	fillerWordAudioBytes, err := sendTTSRequest(openAIAPIKey, "Sure,")
-	if err == nil {
-		// This is guaranteed to come before other audioBytes, as we wait on <-finalTranscriptChan below.
-		rawAudioBytesChan <- fillerWordAudioBytes
-	} else {
-		log.Error().Err(err).Msg("could not generate filler word")
-	}
 
 	chatPrompt := <-finalTranscriptChan
 	go compareToFullTranscript(client, recordingBytesForDebug, chatPrompt)
 	// prompt := "Strep throat recovery timeline in 100 words"
 	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
 	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
-	executeChatRequest(client, chatPrompt, chatOutputChan)
+	executeChatRequest(client, "gpt-4", chatPrompt, chatOutputChan)
 
 	// TODO: Better wait mechanism.
 	time.Sleep(10 * time.Second)
