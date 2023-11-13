@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,9 +21,9 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// MinTextBufferForTtsCharLength is a tradeoff between API call latency and jitter from missing TTSed chunks.
-// This also correlates with "human breathing" in the output intonation.
-const MinTextBufferForTtsCharLength = 10
+// MinTextBufferForTtsCharLength is mostly to prevent saying like "1,"
+// in other cases it's best to just start as soon as first chat completions arrive.
+const MinTextBufferForTtsCharLength = 3
 
 // OpenAiSampleRate - this I have measured by decodedMp3.SampleRate
 const OpenAiSampleRate = 24000
@@ -30,7 +31,6 @@ const OpenAiSampleRate = 24000
 var httpClient = &http.Client{}
 
 func executeChatRequest(client *openai.Client, prompt string, outputChan chan string) {
-	log.Info().Str("prompt", prompt).Msg("executeChatRequest")
 	startTime := time.Now()
 	lastDataReceivedPrintoutTime := time.Now()
 
@@ -46,6 +46,7 @@ func executeChatRequest(client *openai.Client, prompt string, outputChan chan st
 		},
 		Temperature: 0,
 	}
+	log.Info().Str("prompt", prompt).Str("model", chatRequest.Model).Float32("temperature", chatRequest.Temperature).Msg("executeChatRequest")
 
 	// Create a chat completion stream
 	ctx := context.Background()
@@ -237,11 +238,11 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 	i := 0
 	for rawAudioBytes := range rawAudioBytesCh {
 		i += 1
-		if i == 1 {
-			log.Warn().Msg("TRACING HACK: first tts received")
+		if i <= 2 { // Doing 2, cause first is filler word.
+			log.Warn().Int("num", i).Msg("TRACING HACK: tts received")
 		}
 
-		log.Debug().Msgf("attempting to play %d bytes of mp3", len(rawAudioBytes))
+		// log.Debug().Msgf("attempting to play %d bytes of mp3", len(rawAudioBytes))
 		startTime := time.Now()
 
 		// TODO(prod, P0): Only do this locally to debug stuff
@@ -256,7 +257,7 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 			log.Error().Err(decodedMp3Err).Msg("mp3.NewDecoder failed, skipping chunk")
 			continue
 		}
-		log.Trace().Int("sample_rate", decodedMp3.SampleRate()).Int64("byte_size", decodedMp3.Length()).Msg("player START")
+		log.Debug().Int("sample_rate", decodedMp3.SampleRate()).Int64("byte_size", decodedMp3.Length()).Msg("player START")
 		player := otoCtx.NewPlayer(decodedMp3) // Sub-millisecond time
 		player.Play()
 		if i == 1 {
@@ -277,33 +278,84 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 	}
 }
 
+// removeNonEnglishAndMBC removes non-English characters and the "MBC" string from the input text.
+// TODO: HACK, somewhat "silence" is transcribed with random Chinese characters for example:
+// MBC 뉴스 이덕영입니다. Yeah, tell me. a bit about uh, written  in 100 words.  MBC 뉴스 이덕영입니다.
+func removeNonEnglishAndMBC(text string) string {
+	// Regular expression to match non-English characters.
+	nonEnglishRegex := regexp.MustCompile(`[^\x00-\x7F]+`)
+	text = nonEnglishRegex.ReplaceAllString(text, "")
+
+	// Remove all occurrences of "MBC".
+	text = strings.ReplaceAll(text, "MBC", "")
+
+	return text
+}
+
 // TODO(P1, latency): Figure out by how much mp3 is faster than .WAV
 //
 //	3 tests on a 260KB wav vs 67KB mp3 it seems maybe 1100ms vs 1000ms, but there was a run when wav beat mp3 :/
-func transcribeAudio(client *openai.Client, input io.Reader, fileExtension string) (result string, err error) {
+func transcribeAudio(client *openai.Client, input io.Reader, fileExtension string, prompt string) (result string, err error) {
 	startTime := time.Now()
+	// TODO(P0, ux): Try running Whisper locally for quicker transcription speeds (and maybe no filler words needed).
 	req := openai.AudioRequest{
 		Model:    "whisper-1",
 		Reader:   input,
 		FilePath: fmt.Sprintf("this-file-does-not-exist-just-needs-extension.%s", fileExtension),
 		// FilePath: "output/tell-me-about-ba.mp3",
-		//Prompt:      "some previous words",  // TODO
+		// NOTE: Giving the model the previous words improves accuracy.
+		// Whisper can take up to 244 tokens, if more are passed than only the last are used.
+		// TODO(P0, ux): Adding prompt with previous words should improve transcription
+		// Language: "en",
+		Prompt: prompt,
 	}
+
+	log.Debug().Str("model", req.Model).Str("prompt", prompt).Msg("create transcription request")
 	resp, err := client.CreateTranscription(context.Background(), req)
 	if err != nil {
 		err = fmt.Errorf("cannot create transcription %w", err)
 		return
 	}
-	log.Warn().Dur("transcription_time", time.Since(startTime)).Msg("TRACING HACK: create transcription done")
 
 	//var contentBuilder strings.Builder
 	//for _, segment := range resp.Segments {
 	//	contentBuilder.WriteString(segment.Text)
 	//}
 	//result = contentBuilder.String()
-	result = resp.Text
+
+	// TODO: Better "silence" detection
+	result = removeNonEnglishAndMBC(resp.Text)
+	if result != resp.Text {
+		log.Info().Str("original_text", resp.Text).Str("processed_text", result).Msg("transcription post-processing removed some text")
+	}
+
 	log.Debug().Str("transcription", result).Dur("time_elapsed", time.Since(startTime)).Msg("received transcription")
 	return
+}
+
+func transcribeAudioRoutine(client *openai.Client, wavChunksChan chan []byte, finalTranscriptChan chan string) {
+	log.Info().Msgf("transcribeAudioRoutine started")
+	// Replace 'client' and 'transcribeAudio' with your actual client and function
+	var transcriptBuilder strings.Builder
+	for recordingBytes := range wavChunksChan {
+		previousWords := transcriptBuilder.String()
+		transcript, err := transcribeAudio(client, bytes.NewReader(recordingBytes), "wav", previousWords)
+		if err != nil {
+			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chun")
+			continue
+		}
+		transcriptBuilder.WriteString(transcript + " ")
+	}
+
+	finalTranscript := transcriptBuilder.String()
+	log.Info().Msgf("transcribeAudioRoutine ended with finalTranscript %s", finalTranscript)
+	finalTranscriptChan <- finalTranscript
+}
+
+func compareToFullTranscript(client *openai.Client, wavBytes []byte, finalTranscriptFromSlices string) {
+	fullResult, err := transcribeAudio(client, bytes.NewReader(wavBytes), "wav", "")
+	dbg(err)
+	log.Info().Str("full_transcript", fullResult).Str("sliced_together_transcript", finalTranscriptFromSlices).Msg("comparing full transcript to from slices")
 }
 
 // Based off their Python version of the code https://cookbook.openai.com/examples/how_to_stream_completions
@@ -335,31 +387,42 @@ func main() {
 	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
 	// ==== SETUP DONE
 
-	recordingBytes, err := malgoRecord()
+	wavChunksChan := make(chan []byte, 100000)
+	finalTranscriptChan := make(chan string, 1)
+	go transcribeAudioRoutine(client, wavChunksChan, finalTranscriptChan)
+
+	recordingBytesForDebug, err := malgoRecord(wavChunksChan)
 	if err != nil {
 		log.Error().Err(err).Msg("malgo record failed")
 		return
 	}
+	// For debug purposes write the output to a real file so we can replay it.
+	dbg(os.WriteFile("output/recording.wav", recordingBytesForDebug, 0644))
 
-	transcript, err := transcribeAudio(client, bytes.NewReader(recordingBytes), "wav")
-	if err != nil {
-		log.Error().Err(err).Msg("cannot transcribe audio")
-		return
-	}
-	log.Info().Str("transcript", transcript).Msg("transcript received")
-
-	// Documentation for the routines intent / design:
+	// Documentation for the chat and rawAudio routines intent / design:
 	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
 	chatOutputChan := make(chan string, 100000)
 	rawAudioBytesChan := make(chan []byte, 100000)
 	go textToSpeechAndEncodeRoutine(openAIAPIKey, chatOutputChan, rawAudioBytesChan)
 	go playAudioChunksRoutine(otoCtx, rawAudioBytesChan)
 
-	prompt := transcript
+	// TODO: Kinda HACK: Put a filler word before all transcripts are done (usually a 1s delay)
+	// -- although I feel like ChatCompletion already does this.
+	// IDEALLY, we can send a 3.5-turbo request for "generate up to 3 filler words for thinking about response to [first 10 words of transcript]
+	fillerWordAudioBytes, err := sendTTSRequest(openAIAPIKey, "Sure,")
+	if err == nil {
+		// This is guaranteed to come before other audioBytes, as we wait on <-finalTranscriptChan below.
+		rawAudioBytesChan <- fillerWordAudioBytes
+	} else {
+		log.Error().Err(err).Msg("could not generate filler word")
+	}
+
+	chatPrompt := <-finalTranscriptChan
+	go compareToFullTranscript(client, recordingBytesForDebug, chatPrompt)
 	// prompt := "Strep throat recovery timeline in 100 words"
 	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
 	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
-	executeChatRequest(client, prompt, chatOutputChan)
+	executeChatRequest(client, chatPrompt, chatOutputChan)
 
 	// TODO: Better wait mechanism.
 	time.Sleep(10 * time.Second)

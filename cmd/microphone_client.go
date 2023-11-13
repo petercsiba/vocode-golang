@@ -16,14 +16,8 @@ import (
 	"time"
 )
 
-const MyDeviceInputChannels = 1
-const MyDeviceSampleRate = 44100
-
-func chk(err error) {
-	if err != nil {
-		log.Panic().Err(err).Msg("total fail")
-	}
-}
+const MyDeviceInputChannels uint32 = 1
+const MyDeviceSampleRate uint32 = 44100
 
 func dbg(err error) {
 	if err != nil {
@@ -32,8 +26,10 @@ func dbg(err error) {
 }
 
 // This assumes S16 encoding (or two bytes per value)
-func convertBytesToWav(intData []int, sampleRate int, numChannels int) (result []byte, err error) {
-	log.Debug().Int("int_length", len(intData)).Int("sample_rate", sampleRate).Msg("convertBytesToWav")
+func convertBytesToWav(intData []int, sampleRate uint32, numChannels uint32) (result []byte, err error) {
+	iSampleRate := int(sampleRate)
+	iNumChannels := int(numChannels)
+
 	if len(intData) == 0 {
 		return // Nothing to do
 	}
@@ -47,13 +43,13 @@ func convertBytesToWav(intData []int, sampleRate int, numChannels int) (result [
 	// We will call Close ourselves.
 
 	// Convert audio data to IntBuffer
-	inputBuffer := &audio.IntBuffer{Data: intData, Format: &audio.Format{SampleRate: sampleRate, NumChannels: numChannels}}
+	inputBuffer := &audio.IntBuffer{Data: intData, Format: &audio.Format{SampleRate: iSampleRate, NumChannels: iNumChannels}}
 
 	// Create a new WAV wavEncoder
 	bitDepth := 16
 	audioFormat := 1
-	wavEncoder := wav.NewEncoder(inMemoryFile, sampleRate, bitDepth, numChannels, audioFormat)
-	log.Debug().Int("sample_rate", sampleRate).Int("bit_depth", bitDepth).Int("num_channels", numChannels).Int("audio_format", audioFormat).Msg("encoding int stream output as a wav")
+	wavEncoder := wav.NewEncoder(inMemoryFile, iSampleRate, bitDepth, iNumChannels, audioFormat)
+	log.Debug().Int("int_data_length", len(intData)).Int("sample_rate", iSampleRate).Int("bit_depth", bitDepth).Int("num_channels", iNumChannels).Int("audio_format", audioFormat).Msg("encoding int stream output as a wav")
 	// Write to WAV wavEncoder
 	if err = wavEncoder.Write(inputBuffer); err != nil {
 		err = fmt.Errorf("cannot encode byte output as wav %w", err)
@@ -76,13 +72,107 @@ func convertBytesToWav(intData []int, sampleRate int, numChannels int) (result [
 		err = fmt.Errorf("wav output is empty when input was not")
 		return
 	}
-	// For debug purposes write the output to a real file so we can replay it.
-	dbg(os.WriteFile("output/recording.wav", result, 0644))
 	return
 }
 
+func twoByteDataToIntSlice(audioData []byte) []int {
+	intData := make([]int, len(audioData)/2)
+	for i := 0; i < len(audioData); i += 2 {
+		// Convert the pCapturedSamples byte slice to int16 slice for FormatS16 as we go
+		value := int(binary.LittleEndian.Uint16(audioData[i : i+2]))
+		intData[i/2] = value
+	}
+	return intData
+}
+
+// Function to find the last index where the average of the last 100 bytes is below 90.
+func findLastIndexBelowAverage(data []byte, windowSize int, threshold float64) int {
+	n := len(data)
+	if n < windowSize {
+		log.Trace().Int("last_index", -1).Int("data_size", len(data)).Int("window_size", windowSize).Float64("threshold", threshold).Msg("findLastIndexBelowAverage window size too big")
+		return -1 // Not enough data to form a window
+	}
+
+	lastIndex := -1
+	var sum int
+
+	// Initialize the first window
+	for i := 0; i < windowSize; i++ {
+		sum += int(data[i])
+	}
+
+	// Iterate over the array
+	for i := windowSize; i < n; i++ {
+		avg := float64(sum) / float64(windowSize)
+		if avg < threshold {
+			lastIndex = i
+		}
+
+		// Update the sum to include the next byte and exclude the oldest byte
+		sum -= int(data[i-windowSize])
+		sum += int(data[i])
+	}
+
+	log.Trace().Int("last_index", lastIndex).Int("data_size", len(data)).Int("window_size", windowSize).Float64("threshold", threshold).Msg("findLastIndexBelowAverage returned")
+	return lastIndex
+}
+
+func malgoOutputMaybeFlushBuffer(pSampleData []byte, pSampleDataBufferIdx int, wavChunksChan chan []byte, sampleRate uint32, numChannels uint32, isEnd bool) int {
+	flushByteSizeThreshold := 2 * int(sampleRate*2) // About two seconds
+	shouldFlush := isEnd || ((len(pSampleData) - pSampleDataBufferIdx) > flushByteSizeThreshold)
+	// log.Trace().Bool("should_flush", shouldFlush).Int("flush_threshold_byte_size", flushByteSizeThreshold).Int("len_sample_data", len(pSampleData)).Msg("malgoOutputMaybeFlushBuffer")
+	if !shouldFlush {
+		return pSampleDataBufferIdx
+	}
+	startIndex := pSampleDataBufferIdx
+	endIndex := len(pSampleData)
+	windowSize := int(sampleRate) * 2 / 50 // about 20ms
+
+	// Poor mens VAP to detect silence: for now just better understand this, later we can do better.
+	// TODO(P1, ux): See how vocode or WebRTC VAP does that
+	if !isEnd { // when isEnd, we just take the end
+		newData := pSampleData[startIndex:]
+		// TODO: empiric for "silence" - in real world we need much better, Do min an max between 100 and 140
+		threshold := 110.0
+		candidateIndex := findLastIndexBelowAverage(newData, windowSize, threshold)
+		// end of "silence" is likely already when new voice is coming in, so take midpoint
+		if candidateIndex >= 0 {
+			endIndex = startIndex + candidateIndex - (windowSize / 2)
+		} else {
+			endIndex = len(pSampleData)
+		}
+		if endIndex%2 == 1 { // this should only happen in the `candidateIndex >= 0` case
+			endIndex--
+		}
+	}
+
+	if !isEnd && endIndex == len(pSampleData) {
+		// TODO: This makes the algorithm N^2 worst case - which is fine as I am just experimenting for now.
+		log.Trace().Msg("could not find below threshold, waiting for more data")
+		return startIndex
+	}
+
+	log.Trace().Int("start_byte_index", startIndex).Int("end_byte_index", endIndex).Msg("flushing pSample data into wav output")
+
+	byteData := pSampleData[pSampleDataBufferIdx:endIndex]
+	intData := twoByteDataToIntSlice(byteData)
+	wavData, err := convertBytesToWav(intData, sampleRate, numChannels)
+	if err != nil {
+		log.Error().Err(err).Int("int_data_length", len(intData)).Msg("could not convert intData to wavData")
+		return endIndex
+	}
+	wavChunksChan <- wavData
+	dbg(os.WriteFile(fmt.Sprintf("output/%d-%d.wav", startIndex, endIndex), wavData, 0644))
+	if isEnd {
+		log.Info().Msg("closing wavChunksChan from malgoOutputMaybeFlushBuffer")
+		close(wavChunksChan)
+	}
+
+	return endIndex
+}
+
 // Mostly from https://github.com/gen2brain/malgo/blob/master/_examples/capture/capture.go
-func malgoRecord() (result []byte, err error) {
+func malgoRecord(wavChunksChan chan []byte) (result []byte, err error) {
 	log.Info().Msg("malgo record (miniaudio)")
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
 		log.Debug().Msg(strings.Replace("malgo devices: "+message, "\n", "", -1))
@@ -98,8 +188,10 @@ func malgoRecord() (result []byte, err error) {
 
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Duplex)
 	deviceConfig.Capture.Format = malgo.FormatS16
-	deviceConfig.Capture.Channels = MyDeviceInputChannels
-	deviceConfig.SampleRate = MyDeviceSampleRate // TODO: maybe doing lower would fasten transcription up?
+	channels := MyDeviceInputChannels
+	deviceConfig.Capture.Channels = channels
+	sampleRate := MyDeviceSampleRate
+	deviceConfig.SampleRate = sampleRate // TODO: maybe doing lower would fasten transcription up?
 	deviceConfig.Alsa.NoMMap = 1
 
 	sizeInBytes := uint32(malgo.SampleSizeInBytes(deviceConfig.Capture.Format))
@@ -107,26 +199,15 @@ func malgoRecord() (result []byte, err error) {
 		log.Fatal().Uint32("size_in_bytes", sizeInBytes).Msgf("Expected 2 bytes for sample %s", deviceConfig.Capture.Format)
 	}
 
-	intData := make([]int, 0)
 	pSampleData := make([]byte, 0)
-
+	pSampleDataBufferIdx := 0
 	// Some black-magic event-handling which I don't really understand.
 	// https://github.com/gen2brain/malgo/blob/master/_examples/capture/capture.go
 	onRecvFrames := func(pSample2, pSample []byte, framecount uint32) {
-		// sampleCount := framecount * deviceConfig.Capture.Channels * sizeInBytes
-
 		// Empirically, len(pSample) is 480, so for sample rate 44100 it's triggered about every 10ms.
-		intDataDelta := make([]int, len(pSample)/2)
-		for i := 0; i < len(pSample); i += 2 {
-			// Convert the pCapturedSamples byte slice to int16 slice for FormatS16 as we go
-			value := int(binary.LittleEndian.Uint16(pSample[i : i+2]))
-			intDataDelta[i/2] = value
-		}
-		intData = append(intData, intDataDelta...)
+		// sampleCount := framecount * deviceConfig.Capture.Channels * sizeInBytes
 		pSampleData = append(pSampleData, pSample...)
-
-		// For now just better understand this, later we can do a Poor mens VAP to detect silence.
-		// TODO(P1, ux): See how vocode or WebRTC VAP does that
+		pSampleDataBufferIdx = malgoOutputMaybeFlushBuffer(pSampleData, pSampleDataBufferIdx, wavChunksChan, sampleRate, channels, false)
 	}
 
 	captureCallbacks := malgo.DeviceCallbacks{
@@ -138,7 +219,7 @@ func malgoRecord() (result []byte, err error) {
 		return
 	}
 
-	log.Info().Msg("malgo start recording...")
+	log.Info().Msg("malgo START recording...")
 	timeStart := time.Now()
 	err = device.Start()
 	if err != nil {
@@ -150,28 +231,29 @@ func malgoRecord() (result []byte, err error) {
 	fmt.Println("Press Enter to stop recording...")
 	_, err = fmt.Scanln()
 	dbg(err)
-	log.Debug().Dur("recording_duration", time.Since(timeStart)).Msg("malgo stop recording")
-	log.Warn().Msg("TRACING HACK: malgo stop recording")
-	timeStop := time.Now()
+	log.Info().Dur("recording_duration", time.Since(timeStart)).Msg("malgo STOP recording")
+	log.Warn().Msg("TRACING HACK: malgo STOP")
 
 	device.Uninit()
+	// TODO(P0, ux): IF we can detect silence, than two things:
+	// * We can use silence to stop the recording
+	// * We do NOT need to send the end silence for transcription (can give us 500-1000ms).
+	malgoOutputMaybeFlushBuffer(pSampleData, pSampleDataBufferIdx, wavChunksChan, sampleRate, channels, true)
 
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
-	result, err = convertBytesToWav(intData, int(deviceConfig.SampleRate), int(deviceConfig.Capture.Channels))
-	log.Warn().Dur("latency", time.Since(timeStop)).Msg("TRACING HACK: convert bytes to raw")
+	result, err = convertBytesToWav(twoByteDataToIntSlice(pSampleData), sampleRate, channels)
 	return
 }
 
-func convertInt16SliceToIntSlice(input []int16) []int {
-	output := make([]int, len(input))
-	for i, v := range input {
-		output[i] = int(v)
-	}
-	return output
-}
-
 // TODO: I never got this fully work - keeping in case someone wants to finish up the bytes to wav part (and interrupt).
+//
+//func chk(err error) {
+//	if err != nil {
+//		log.Panic().Err(err).Msg("total fail")
+//	}
+//}
+//
 //func recordAudioPortaudioToWav() (result []byte, err error) {
 //	// Initialize PortAudio
 //	chk(portaudio.Initialize())
