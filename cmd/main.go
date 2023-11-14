@@ -9,12 +9,17 @@ import (
 	"github.com/ebitengine/oto/v3"
 	"github.com/hajimehoshi/go-mp3"
 	"github.com/joho/godotenv"
+	"github.com/petrzlen/vocode-golang/pkg/input_device"
+	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/sashabaranov/go-openai"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -29,6 +34,22 @@ const MinTextBufferForTtsCharLength = 3
 const OpenAiSampleRate = 24000
 
 var httpClient = &http.Client{}
+
+func setupSignalHandler() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGSEGV)
+
+	go func() {
+		sig := <-sigs
+		log.Error().Msgf("Received signal: %v\n", sig)
+
+		// Print stack trace
+		debug.PrintStack()
+
+		// Exit if necessary
+		os.Exit(1)
+	}()
+}
 
 func executeChatRequest(client *openai.Client, model string, prompt string, outputChan chan string) {
 	startTime := time.Now()
@@ -334,21 +355,28 @@ func transcribeAudio(client *openai.Client, input io.Reader, fileExtension strin
 	return
 }
 
-func transcribeAudioRoutine(client *openai.Client, wavChunksChan chan []byte, finalTranscriptChan chan string, earlyTranscriptChan chan string) {
+func transcribeAudioRoutine(client *openai.Client, audioChunksChan chan models.AudioData, finalTranscriptChan chan string, earlyTranscriptChan chan string) {
 	log.Info().Msgf("transcribeAudioRoutine started")
 	routineStart := time.Now()
 	sendEarlyTranscript := true
 
 	// Replace 'client' and 'transcribeAudio' with your actual client and function
 	var transcriptBuilder strings.Builder
-	for recordingBytes := range wavChunksChan {
+	for audioChunk := range audioChunksChan {
+		audioChunk.Trace.ReceivedAt = time.Now()
+
+		recordingBytes := audioChunk.ByteData
 		previousWords := transcriptBuilder.String()
 		transcript, err := transcribeAudio(client, bytes.NewReader(recordingBytes), "wav", previousWords)
 		if err != nil {
-			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chun")
+			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chunk")
 			continue
 		}
 		transcriptBuilder.WriteString(transcript + " ")
+
+		audioChunk.Trace.ProcessedAt = time.Now()
+		audioChunk.Trace.Processor = "transcribe_open_ai_whisper"
+		audioChunk.Trace.Log()
 
 		if sendEarlyTranscript && time.Since(routineStart).Seconds() > 7 {
 			sendEarlyTranscript = false
@@ -376,15 +404,17 @@ func fillerWordRoutine(client *openai.Client, openAIAPIKey string, earlyTranscri
 
 	//prompt := fmt.Sprintf("I want to respond to this input text with a few filler words; example 1: Hm, San Francisco... Example 2: Alright, your fathers birthday... Input text: %s", earlyTranscript)
 	//prompt := fmt.Sprintf("Generate a few filler words with mentioning the topic to be used while i am thinking. Only output the filler words, up to 5 words. The input text: %s", earlyTranscript)
-	fillerPrompt := fmt.Sprintf("generate the most appropriate filler word to this transcript, only output a single word: %s", earlyTranscript)
-	fillerPromptResult := make(chan string, 1000)
-	go executeChatRequest(client, "gpt-3.5-turbo", fillerPrompt, fillerPromptResult)
-	// go executeChatRequest(client, "gpt-4", prompt, promptResult)
-	fillerWords := "..."
-	for token := range fillerPromptResult {
-		fillerWords += token
-	}
+	//fillerPrompt := fmt.Sprintf("generate the most appropriate filler word to this transcript, only output a single word: %s", earlyTranscript)
+	//fillerPromptResult := make(chan string, 1000)
+	//go executeChatRequest(client, "gpt-3.5-turbo", fillerPrompt, fillerPromptResult)
+	//// go executeChatRequest(client, "gpt-4", prompt, promptResult)
+	//fillerWords := "... "
+	//for token := range fillerPromptResult {
+	//	fillerWords += token
+	//}
+	//fillerWords += " "
 
+	fillerWords := "hmm Got it, "
 	topicPrompt := fmt.Sprintf("etract conversation title in 1-4 words from this transcript: %s", earlyTranscript)
 	topicPromptResult := make(chan string, 1000)
 	go executeChatRequest(client, "gpt-3.5-turbo", topicPrompt, topicPromptResult)
@@ -407,6 +437,7 @@ func fillerWordRoutine(client *openai.Client, openAIAPIKey string, earlyTranscri
 // Translated with GPT-4: https://chat.openai.com/c/c723eeaa-2c24-42c2-aabb-0f5582d0f031
 // Using https://github.com/sashabaranov/go-openai/blob/d6f3bdcdac9172ab5248d6be8c3e1761446a434c/chat_stream.go#L62
 func main() {
+	setupSignalHandler()
 	setupStart := time.Now()
 	// Set up zerolog with custom output to include milliseconds in the timestamp
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{
@@ -428,25 +459,39 @@ func main() {
 	client := openai.NewClient(openAIAPIKey)
 
 	// About 200ms
+	audioInput, err := input_device.NewMicrophone()
+	if err != nil {
+		log.Panic().Err(err).Msgf("cannot init microphone")
+	}
+
 	otoCtx := setupOtoContext(OpenAiSampleRate, 2)
 	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
 	// ==== SETUP DONE
 
-	wavChunksChan := make(chan []byte, 100000)
+	audioChunksChan := make(chan models.AudioData, 100000) // TODO: feels to be allocating too much but shrug
 	finalTranscriptChan := make(chan string, 1)
 	earlyTranscriptChan := make(chan string, 1)
 	chatOutputChan := make(chan string, 100000)
 	rawAudioBytesChan := make(chan []byte, 100000)
-	go transcribeAudioRoutine(client, wavChunksChan, finalTranscriptChan, earlyTranscriptChan)
+	go transcribeAudioRoutine(client, audioChunksChan, finalTranscriptChan, earlyTranscriptChan)
 	go fillerWordRoutine(client, openAIAPIKey, earlyTranscriptChan, rawAudioBytesChan)
 
-	recordingBytesForDebug, err := malgoRecord(wavChunksChan)
+	err = audioInput.StartRecording(audioChunksChan)
 	if err != nil {
 		log.Error().Err(err).Msg("malgo record failed")
 		return
 	}
+
+	// TODO(P0, ux): Get this through VAD when we stop talking
+	fmt.Println("Press Enter to stop recording...")
+	_, err = fmt.Scanln()
+
+	entireWavRecording, err := audioInput.StopRecording()
+	if err != nil {
+		log.Error().Err(err).Msg("audio input stop recording")
+	}
 	// For debug purposes write the output to a real file so we can replay it.
-	dbg(os.WriteFile("output/recording.wav", recordingBytesForDebug, 0644))
+	dbg(os.WriteFile("output/entire-recording.wav", entireWavRecording, 0644))
 
 	// Documentation for the chat and rawAudio routines intent / design:
 	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
@@ -454,7 +499,7 @@ func main() {
 	go playAudioChunksRoutine(otoCtx, rawAudioBytesChan)
 
 	chatPrompt := <-finalTranscriptChan
-	go compareToFullTranscript(client, recordingBytesForDebug, chatPrompt)
+	go compareToFullTranscript(client, entireWavRecording, chatPrompt)
 	// prompt := "Strep throat recovery timeline in 100 words"
 	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
 	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
@@ -462,4 +507,10 @@ func main() {
 
 	// TODO: Better wait mechanism.
 	time.Sleep(10 * time.Second)
+}
+
+func dbg(err error) {
+	if err != nil {
+		log.Debug().Err(err).Msg("sth non-essential failed")
+	}
 }
