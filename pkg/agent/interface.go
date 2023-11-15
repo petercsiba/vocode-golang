@@ -1,8 +1,8 @@
-package input_device
+package agent
 
 import "github.com/petrzlen/vocode-golang/pkg/models"
 
-type AudioInputDevice interface {
+type Interface interface {
 	StartRecording(recordingChan chan models.AudioData) error
 	StopRecording() ([]byte, error)
 	// Stop() error

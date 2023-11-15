@@ -1,6 +1,6 @@
 // TLDR; Go itself cannot work with Microphone's well
 // BUT it can bind with C-libraries which can do this with a bit of black-magic.
-package input_device
+package audioio
 
 import (
 	"fmt"
@@ -37,7 +37,7 @@ type microphone struct {
 
 // NewMicrophone inits the microphone device,
 // you should defer StopRecording
-func NewMicrophone() (result AudioInputDevice, err error) {
+func NewMicrophone() (result InputDevice, err error) {
 	log.Info().Msg("malgo init context (miniaudio)")
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
 		log.Debug().Msg(strings.Replace("malgo devices: "+message, "\n", "", -1))

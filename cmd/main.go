@@ -8,9 +8,8 @@ import (
 	"fmt"
 	"github.com/hajimehoshi/go-mp3"
 	"github.com/joho/godotenv"
-	"github.com/petrzlen/vocode-golang/pkg/input_device"
+	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/petrzlen/vocode-golang/pkg/models"
-	"github.com/petrzlen/vocode-golang/pkg/output_device"
 	"github.com/sashabaranov/go-openai"
 	"io"
 	"net/http"
@@ -236,7 +235,7 @@ func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, raw
 	}
 }
 
-func playAudioChunksRoutine(audioOutput output_device.AudioOutputDevice, rawAudioBytesCh chan []byte) {
+func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesCh chan []byte) {
 	log.Info().Msgf("playAudioChunksRoutine started")
 
 	i := 0
@@ -437,11 +436,11 @@ func main() {
 	client := openai.NewClient(openAIAPIKey)
 
 	// About 200ms
-	audioInput, err := input_device.NewMicrophone()
+	audioInput, err := audioio.NewMicrophone()
 	if err != nil {
 		log.Panic().Err(err).Msgf("cannot init microphone")
 	}
-	audioOutput, err := output_device.NewSpeakers(OpenAiSampleRate, 2)
+	audioOutput, err := audioio.NewSpeakers(OpenAiSampleRate, 2)
 	if err != nil {
 		log.Panic().Err(err).Msgf("cannot init speakers")
 	}

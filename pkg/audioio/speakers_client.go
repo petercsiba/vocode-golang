@@ -1,4 +1,4 @@
-package output_device
+package audioio
 
 import (
 	"fmt"
@@ -32,7 +32,7 @@ type speakers struct {
 	stopFlag bool       // Indicates if playback should be stopped early
 }
 
-func NewSpeakers(sampleRate int, numChannels int) (AudioOutputDevice, error) {
+func NewSpeakers(sampleRate int, numChannels int) (OutputDevice, error) {
 	op := &oto.NewContextOptions{
 		SampleRate:   sampleRate,
 		ChannelCount: numChannels,
