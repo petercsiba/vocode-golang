@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/hajimehoshi/go-mp3"
@@ -11,9 +10,9 @@ import (
 	"github.com/petrzlen/vocode-golang/pkg/agent"
 	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/petrzlen/vocode-golang/pkg/models"
+	"github.com/petrzlen/vocode-golang/pkg/synthesizer"
 	"github.com/sashabaranov/go-openai"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
@@ -33,8 +32,6 @@ const MinTextBufferForTtsCharLength = 3
 // OpenAiSampleRate - this I have measured by decodedMp3.SampleRate
 const OpenAiSampleRate = 24000
 
-var httpClient = &http.Client{}
-
 func setupSignalHandler() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGSEGV)
@@ -50,77 +47,6 @@ func setupSignalHandler() {
 		os.Exit(1)
 	}()
 }
-
-// This is to by-pass not-yet-implemented APIs in go-openai
-func sendRequest(openAIAPIKey string, method string, endpoint string, requestStr string) (result []byte, err error) {
-	requestStart := time.Now()
-	// Construct the request body
-	reqBody := strings.NewReader(requestStr)
-
-	// Create and send the request
-	req, err := http.NewRequest(method, "https://api.openai.com/v1/"+endpoint, reqBody)
-	if err != nil {
-		return
-	}
-	req.Header.Add("Authorization", "Bearer "+openAIAPIKey)
-	req.Header.Add("Content-Type", "application/json")
-
-	// Send the request
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer func() { resp.Body.Close() }()
-
-	log.Debug().Dur("request_time", time.Since(requestStart)).Str("method", method).Str("endpoint", endpoint).Int("status_code", resp.StatusCode).Msg("request done")
-
-	if resp.StatusCode != http.StatusOK {
-		errMsg, _ := io.ReadAll(resp.Body)
-		err = fmt.Errorf("received non-200 status %d from %s: %s", resp.StatusCode, endpoint, errMsg)
-		log.Debug().Err(err).Str("method", method).Str("endpoint", endpoint).Str("requestStr", requestStr).Msg("request to openai failed")
-		return
-	}
-
-	readStart := time.Now()
-	result, err = io.ReadAll(resp.Body)
-	log.Debug().Dur("response_body_read_time", time.Since(readStart)).Int("response_byte_size", len(result)).Str("endpoint", endpoint).Msg("request body read done")
-	if err != nil {
-		err = fmt.Errorf("could not read response %w", err)
-		return
-	}
-	return
-}
-
-// TTSPayload for sendTTSRequest
-type TTSPayload struct {
-	Model          string  `json:"model"`
-	Input          string  `json:"input"`
-	Voice          string  `json:"voice"`
-	ResponseFormat string  `json:"response_format"`
-	Speed          float64 `json:"speed"`
-}
-
-// TODO(devx, P1): Replace with the official one after implemented
-// https://github.com/sashabaranov/go-openai/pull/528/files?diff=unified&w=0
-func sendTTSRequest(openAIAPIKey string, input string, speed float64) (rawAudioBytes []byte, err error) {
-	log.Debug().Str("input", input).Float64("speed", speed).Msg("sendTTSRequest start")
-
-	payload := TTSPayload{
-		Model:          "tts-1",
-		Input:          input,
-		Voice:          "echo",
-		ResponseFormat: "mp3", // TODO(ux, P1): Opus should be a better format for streaming, using mp3 for ease.
-		Speed:          speed,
-	}
-	reqStr, _ := json.Marshal(payload)
-	rawAudioBytes, err = sendRequest(openAIAPIKey, "POST", "audio/speech", string(reqStr))
-	if err != nil {
-		err = fmt.Errorf("could not do audio/speech for %s cause %w", reqStr, err)
-		return
-	}
-	return
-}
-
 func isPunctuationMarkAtEnd(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -134,7 +60,7 @@ func isPunctuationMarkAtEnd(s string) bool {
 	}
 }
 
-func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, rawAudioBytesCh chan<- []byte) {
+func textToSpeechAndEncodeRoutine(tts synthesizer.Synthesizer, textCh <-chan string, rawAudioBytesCh chan<- []byte) {
 	log.Info().Msgf("textToSpeechAndEncodeRoutine started")
 	var buffer string
 
@@ -153,7 +79,7 @@ func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, raw
 				}
 				// Process the buffer;
 				// Speed 1.15 was reverse engineered from the ChatGPT app
-				rawAudioBytes, err := sendTTSRequest(openAIAPIKey, buffer, 1.15)
+				rawAudioBytes, err := tts.CreateSpeech(buffer, 1.15)
 				if err == nil {
 					rawAudioBytesCh <- rawAudioBytes
 				} else {
@@ -306,7 +232,7 @@ func compareToFullTranscript(client *openai.Client, wavBytes []byte, finalTransc
 	log.Info().Str("full_transcript", fullResult).Str("sliced_together_transcript", finalTranscriptFromSlices).Msg("comparing full transcript to from slices")
 }
 
-func fillerWordRoutine(chatAgent agent.ChatAgent, openAIAPIKey string, earlyTranscriptChan chan string, audioOutputChan chan []byte) {
+func fillerWordRoutine(chatAgent agent.ChatAgent, tts synthesizer.Synthesizer, earlyTranscriptChan chan string, audioOutputChan chan []byte) {
 	log.Info().Msgf("fillerWordRoutine START")
 	// This is the 5-10
 	earlyTranscript := <-earlyTranscriptChan
@@ -334,7 +260,7 @@ func fillerWordRoutine(chatAgent agent.ChatAgent, openAIAPIKey string, earlyTran
 	fillerWords += "... ."
 
 	// Speed 1.0, filler words are more natural to produce slow.
-	fillerWordAudioBytes, err := sendTTSRequest(openAIAPIKey, fillerWords, 1.0)
+	fillerWordAudioBytes, err := tts.CreateSpeech(fillerWords, 1.0)
 	if err == nil {
 		log.Info().Msgf("generating filler words %s", fillerWords)
 		audioOutputChan <- fillerWordAudioBytes
@@ -369,6 +295,7 @@ func main() {
 	}
 	client := openai.NewClient(openAIAPIKey)
 	chatAgent := agent.NewOpenAIChatAgent(client)
+	tts := synthesizer.NewOpenAITTS(openAIAPIKey)
 
 	// About 200ms
 	audioInput, err := audioio.NewMicrophone()
@@ -388,7 +315,7 @@ func main() {
 	chatOutputChan := make(chan string, 100000)
 	rawAudioBytesChan := make(chan []byte, 100000)
 	go transcribeAudioRoutine(client, audioChunksChan, finalTranscriptChan, earlyTranscriptChan)
-	go fillerWordRoutine(chatAgent, openAIAPIKey, earlyTranscriptChan, rawAudioBytesChan)
+	go fillerWordRoutine(chatAgent, tts, earlyTranscriptChan, rawAudioBytesChan)
 
 	err = audioInput.StartRecording(audioChunksChan)
 	if err != nil {
@@ -409,7 +336,7 @@ func main() {
 
 	// Documentation for the chat and rawAudio routines intent / design:
 	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
-	go textToSpeechAndEncodeRoutine(openAIAPIKey, chatOutputChan, rawAudioBytesChan)
+	go textToSpeechAndEncodeRoutine(tts, chatOutputChan, rawAudioBytesChan)
 	go playAudioChunksRoutine(audioOutput, rawAudioBytesChan)
 
 	chatPrompt := <-finalTranscriptChan

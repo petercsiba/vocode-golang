@@ -19,7 +19,6 @@ func NewOpenAIChatAgent(client *openai.Client) ChatAgent {
 }
 
 // RunPrompt
-// TODO: Feels like we need a better interface here, but lets wait until conversation.go evolves.
 func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, prompt string, outputChan chan string) error {
 	model := "gpt-3.5-turbo"
 	if modelQuality == SlowerAndSmarter {
