@@ -1,6 +1,8 @@
 package synthesizer
 
-/*
+import "github.com/petrzlen/vocode-golang/pkg/models"
+
+/* // vocode-python
    async def create_speech(
        self,
        message: BaseMessage,
@@ -9,5 +11,5 @@ package synthesizer
 */
 
 type Synthesizer interface {
-	CreateSpeech(text string, speed float64) (rawAudioBytes []byte, err error)
+	CreateSpeech(text string, speed float64) (audioOutput models.AudioData, err error)
 }

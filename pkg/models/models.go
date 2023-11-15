@@ -29,3 +29,48 @@ type AudioData struct {
 	Text     string // text representation
 	Trace    Trace
 }
+
+type Message struct {
+	Role       string
+	Content    string
+	FinishedAt time.Time
+}
+
+// Conversation for the Chat API
+// TODO: We can stop using it once the Assistant API supports streaming
+type Conversation struct {
+	StartedAt time.Time
+	Messages  []Message
+}
+
+func NewConversationSimple(text string) *Conversation {
+	return &Conversation{
+		StartedAt: time.Now(),
+		Messages: []Message{
+			{Role: "user", Content: text, FinishedAt: time.Now()},
+		},
+	}
+}
+
+func (c *Conversation) Add(role string, content string) {
+	c.Messages = append(c.Messages, Message{
+		Role:       role,
+		Content:    content,
+		FinishedAt: time.Now(),
+	})
+}
+
+func (c *Conversation) GetLastPrompt() string {
+	if len(c.Messages) == 0 {
+		return "" // Yes, I am a bit lazy
+	}
+	return c.Messages[len(c.Messages)-1].Content
+}
+
+func (c *Conversation) DebugLog() {
+	log.Debug().Msg("DUMPING FULL CONVERSATION")
+	for i, message := range c.Messages {
+		at := message.FinishedAt.Sub(c.StartedAt)
+		log.Debug().Int("i", i).Str("role", message.Role).Dur("since_started", at).Msg(message.Content)
+	}
+}

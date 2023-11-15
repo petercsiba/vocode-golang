@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/rs/zerolog/log"
 	"github.com/sashabaranov/go-openai"
 	"io"
@@ -18,8 +19,17 @@ func NewOpenAIChatAgent(client *openai.Client) ChatAgent {
 	return &openaiChatAgent{client: client}
 }
 
+func conversationToOpenAiMessages(conversation *models.Conversation) []openai.ChatCompletionMessage {
+	result := make([]openai.ChatCompletionMessage, len(conversation.Messages))
+	for i, message := range conversation.Messages {
+		result[i].Role = message.Role
+		result[i].Content = message.Content
+	}
+	return result
+}
+
 // RunPrompt
-func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, prompt string, outputChan chan string) error {
+func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, conversation *models.Conversation, outputChan chan string) error {
 	model := "gpt-3.5-turbo"
 	if modelQuality == SlowerAndSmarter {
 		model = "gpt-4"
@@ -30,16 +40,11 @@ func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, prompt string, ou
 
 	// Create a chat completion request
 	chatRequest := openai.ChatCompletionRequest{
-		Model: model,
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
+		Model:       model,
+		Messages:    conversationToOpenAiMessages(conversation),
 		Temperature: 0,
 	}
-	log.Info().Str("prompt", prompt).Str("model", chatRequest.Model).Float32("temperature", chatRequest.Temperature).Msg("executeChatRequest")
+	log.Info().Str("prompt", conversation.GetLastPrompt()).Str("model", chatRequest.Model).Float32("temperature", chatRequest.Temperature).Msg("executeChatRequest")
 
 	// Create a chat completion stream
 	ctx := context.Background()

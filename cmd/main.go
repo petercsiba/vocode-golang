@@ -59,14 +59,14 @@ func isPunctuationMarkAtEnd(s string) bool {
 	}
 }
 
-func textToSpeechAndEncodeRoutine(tts synthesizer.Synthesizer, textCh <-chan string, rawAudioBytesCh chan<- []byte) {
+func textToSpeechAndEncodeRoutine(tts synthesizer.Synthesizer, textChan <-chan string, audioOutputChan chan<- models.AudioData) {
 	log.Info().Msgf("textToSpeechAndEncodeRoutine started")
 	var buffer string
 
 	firstEligibleBuffer := true
 	for {
 		select {
-		case text, ok := <-textCh:
+		case text, ok := <-textChan:
 			if ok {
 				buffer += text
 			}
@@ -78,9 +78,9 @@ func textToSpeechAndEncodeRoutine(tts synthesizer.Synthesizer, textCh <-chan str
 				}
 				// Process the buffer;
 				// Speed 1.15 was reverse engineered from the ChatGPT app
-				rawAudioBytes, err := tts.CreateSpeech(buffer, 1.15)
+				audioOutput, err := tts.CreateSpeech(buffer, 1.15)
 				if err == nil {
-					rawAudioBytesCh <- rawAudioBytes
+					audioOutputChan <- audioOutput
 				} else {
 					log.Error().Msgf("cannot buffer tts text for %s cause %v", buffer, err)
 				}
@@ -153,6 +153,8 @@ func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan
 			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chunk")
 			continue
 		}
+		transcriptBuilder.WriteString(transcript)
+		transcriptBuilder.WriteString(" ")
 		audioChunk.Text = transcript
 		audioChunk.Trace.ProcessedAt = time.Now()
 		audioChunk.Trace.Processor = "transcribe_open_ai_whisper"
@@ -179,7 +181,7 @@ func compareToFullTranscript(transcriber transcriber.Transcriber, wavBytes []byt
 	log.Info().Str("full_transcript", fullResult).Str("sliced_together_transcript", finalTranscriptFromSlices).Msg("comparing full transcript to from slices")
 }
 
-func fillerWordRoutine(chatAgent agent.ChatAgent, tts synthesizer.Synthesizer, earlyTranscriptChan chan string, audioOutputChan chan []byte) {
+func fillerWordRoutine(chatAgent agent.ChatAgent, tts synthesizer.Synthesizer, earlyTranscriptChan chan string, audioOutputChan chan models.AudioData) {
 	log.Info().Msgf("fillerWordRoutine START")
 	// This is the 5-10
 	earlyTranscript := <-earlyTranscriptChan
@@ -202,10 +204,10 @@ func fillerWordRoutine(chatAgent agent.ChatAgent, tts synthesizer.Synthesizer, e
 		//fillerWords += " "
 
 		fillerWords = "Hmm got it, "
-		topicPrompt := fmt.Sprintf("etract conversation title in 1-4 words from this transcript: %s", earlyTranscript)
+		topicPrompt := fmt.Sprintf("what is the main object/subject asked for in this transcript, only return the object/subject name using maximum of 3 words: %s", earlyTranscript)
 		topicPromptResult := make(chan string, 1000)
 		go func() {
-			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, topicPrompt, topicPromptResult))
+			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, models.NewConversationSimple(topicPrompt), topicPromptResult))
 		}()
 		for token := range topicPromptResult {
 			fillerWords += token
@@ -232,29 +234,31 @@ func userInterruptRoutine(stopChan chan struct{}) {
 	close(stopChan) // Send interrupt signal
 }
 
-func playTTSUntilInterruptRoutine(ttsOutputBuffer chan []byte, audioToPlayChan chan []byte) {
+func playTTSUntilInterruptRoutine(ttsOutputBuffer chan models.AudioData, audioToPlayChan chan []byte) string {
 	log.Info().Msg("playTTSUntilInterruptRoutine START")
 	interruptChan := make(chan struct{})
 	go userInterruptRoutine(interruptChan)
 
+	var outputText strings.Builder
 	// Main loop for processing ttsOutputBuffer
 	for {
 		select {
 		case ttsOutput, ok := <-ttsOutputBuffer:
 			if !ok {
 				log.Info().Msg("ttsOutputBuffer closed. playTTSUntilInterruptRoutine STOP")
-				return
+				return outputText.String()
 			}
 			select {
-			case audioToPlayChan <- ttsOutput:
-				// Process the audio
+			// Plays the audio
+			case audioToPlayChan <- ttsOutput.ByteData:
+				outputText.WriteString(ttsOutput.Text)
 			case <-interruptChan:
 				log.Info().Msg("Interrupt received. playTTSUntilInterruptRoutine STOP")
-				return
+				return outputText.String()
 			}
 		case <-interruptChan:
 			log.Info().Msg("Interrupt received. playTTSUntilInterruptRoutine STOP")
-			return
+			return outputText.String()
 		}
 	}
 	// TODO: ideally we should call outputAudio.Stop() -- to not wait until the entire sentence is done
@@ -283,6 +287,7 @@ func main() {
 		log.Panic().Msgf("OPEN_AI_API_KEY is not set")
 	}
 	client := openai.NewClient(openAIAPIKey)
+
 	whisper := transcriber.NewOpenAIWhisper(client)
 	chatAgent := agent.NewOpenAIChatAgent(client)
 	tts := synthesizer.NewOpenAITTS(openAIAPIKey)
@@ -302,13 +307,14 @@ func main() {
 	audioToPlayChan := make(chan []byte) // non-buffer
 	go playAudioChunksRoutine(audioOutput, audioToPlayChan)
 
-	allPrompts := ""
+	fullConvo := &models.Conversation{}
+
 	for runLoop {
 		i++
 		inputAudioChunksChan := make(chan models.AudioData, 100000)
 		inputTextChunksChan := make(chan models.AudioData, 100000)
 		chatOutputChan := make(chan string, 100000)
-		ttsOutputBuffer := make(chan []byte, 3)
+		ttsOutputBuffer := make(chan models.AudioData, 3)
 
 		// TODO: feels to be allocating too much but shrug
 		// finalTranscriptChan := make(chan string, 1)
@@ -333,9 +339,9 @@ func main() {
 
 		chatPrompt := ""
 		for inputTextChunk := range inputTextChunksChan {
-			chatPrompt += inputTextChunk.Text
+			chatPrompt += inputTextChunk.Text + " "
 		}
-		allPrompts += chatPrompt
+		fullConvo.Add("user", chatPrompt)
 		// Just for debug
 		go compareToFullTranscript(whisper, entireWavRecording, chatPrompt)
 
@@ -343,15 +349,17 @@ func main() {
 		// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
 		go textToSpeechAndEncodeRoutine(tts, chatOutputChan, ttsOutputBuffer)
 
-		// prompt := "Strep throat recovery timeline in 100 words"
-		// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
 		// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
 		go func() {
-			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, allPrompts, chatOutputChan))
+			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, fullConvo, chatOutputChan))
 		}()
 		// TODO: Use the assistant, allPrompts is too hacky lol
 
-		playTTSUntilInterruptRoutine(ttsOutputBuffer, audioToPlayChan)
+		outputText := playTTSUntilInterruptRoutine(ttsOutputBuffer, audioToPlayChan)
+		// TODO(P0, ux): We have to stop the Chat and TTS routines to free up the API resources.
+
+		fullConvo.Add("assistant", outputText)
+		fullConvo.DebugLog()
 	}
 }
 

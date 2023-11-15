@@ -37,6 +37,7 @@ type microphone struct {
 
 // NewMicrophone inits the microphone device,
 // you should defer StopRecording
+// TODO(P0, devx): We should add a Cleanup method, and make the Start / Stop recording to wake / sleep the input device.
 func NewMicrophone() (result InputDevice, err error) {
 	log.Info().Msg("malgo init context (miniaudio)")
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {

@@ -3,6 +3,7 @@ package synthesizer
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/rs/zerolog/log"
 	"io"
 	"net/http"
@@ -24,7 +25,7 @@ func NewOpenAITTS(openAIAPIKey string) Synthesizer {
 
 // TODO(devx, P1): Replace with the openai-go one after implemented
 // https://github.com/sashabaranov/go-openai/pull/528/files?diff=unified&w=0
-func (o *openAITTS) CreateSpeech(text string, speed float64) (rawAudioBytes []byte, err error) {
+func (o *openAITTS) CreateSpeech(text string, speed float64) (audioOutput models.AudioData, err error) {
 	log.Debug().Str("input", text).Float64("speed", speed).Msg("sendTTSRequest start")
 
 	payload := TTSPayload{
@@ -35,11 +36,23 @@ func (o *openAITTS) CreateSpeech(text string, speed float64) (rawAudioBytes []by
 		Speed:          speed,
 	}
 	reqStr, _ := json.Marshal(payload)
-	rawAudioBytes, err = o.sendRequest("POST", "audio/speech", string(reqStr))
+	rawAudioBytes, err := o.sendRequest("POST", "audio/speech", string(reqStr))
 	if err != nil {
 		err = fmt.Errorf("could not do audio/speech for %s cause %w", reqStr, err)
 		return
 	}
+	audioOutput = models.AudioData{
+		ByteData: rawAudioBytes,
+		Format:   "wav",
+		Length:   0, // TODO
+		Text:     text,
+		Trace: models.Trace{
+			DataName:  "audio_output",
+			CreatedAt: time.Now(),
+			Creator:   "openAITTS.CreateSpeech",
+		},
+	}
+
 	return
 }
 

@@ -1,5 +1,7 @@
 package agent
 
+import "github.com/petrzlen/vocode-golang/pkg/models"
+
 type ModelQuality int
 
 // Declare constants with the custom type. These are your enum values.
@@ -25,5 +27,5 @@ func (m ModelQuality) String() string {
 // TODO: Feels like we need a better interface here, but lets wait until conversation.go evolves.
 // - Probably needs to be stateful.
 type ChatAgent interface {
-	RunPrompt(modelQuality ModelQuality, prompt string, outputChan chan string) error
+	RunPrompt(modelQuality ModelQuality, conversation *models.Conversation, outputChan chan string) error
 }
