@@ -26,5 +26,6 @@ type AudioData struct {
 	ByteData []byte
 	Format   string
 	Length   time.Duration
+	Text     string // text representation
 	Trace    Trace
 }

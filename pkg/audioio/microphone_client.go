@@ -77,7 +77,7 @@ func (m *microphone) getNumChannels() uint32 {
 	return m.deviceConfig.Capture.Channels
 }
 
-// StartRecording can only be called once for NewMicrophone
+// StartRecording can only be called once for NewMicrophone (maybe?)
 // Mostly from https://github.com/gen2brain/malgo/blob/master/_examples/capture/capture.go
 func (m *microphone) StartRecording(recordingChan chan models.AudioData) (err error) {
 	m.recordingChan = recordingChan
@@ -118,6 +118,7 @@ func (m *microphone) StartRecording(recordingChan chan models.AudioData) (err er
 func (m *microphone) StopRecording() (entireRecording []byte, err error) {
 	log.Info().Dur("recording_duration", time.Since(m.recordingStart)).Msg("malgo STOP recording")
 	log.Warn().Msg("TRACING HACK: malgo STOP")
+	// TODO: You have uninitialized all contexts while an associated device is still active.
 	dbg(m.device.Stop())
 	dbg(m.malgoContext.Uninit())
 
@@ -132,6 +133,9 @@ func (m *microphone) StopRecording() (entireRecording []byte, err error) {
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
 	entireRecording, err = audio_utils.ConvertByteSamplesToWav(m.pSampleData, m.getSampleRate(), m.getNumChannels())
+
+	log.Info().Msg("closing recordingChan from StopRecording")
+	close(m.recordingChan)
 
 	m.malgoContext.Free()
 	return
@@ -238,10 +242,6 @@ func (m *microphone) maybeFlushBuffer(isEnd bool) int {
 	}
 	m.recordingChan <- audioData
 	dbg(os.WriteFile(fmt.Sprintf("output/%d-%d.wav", startIndex, endIndex), wavData, 0644))
-	if isEnd {
-		log.Info().Msg("closing wavChunksChan from malgoOutputMaybeFlushBuffer")
-		close(m.recordingChan)
-	}
 
 	return endIndex
 }

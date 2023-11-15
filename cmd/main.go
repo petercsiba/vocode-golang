@@ -31,21 +31,21 @@ const MinTextBufferForTtsCharLength = 3
 // OpenAiSampleRate - this I have measured by decodedMp3.SampleRate
 const OpenAiSampleRate = 24000
 
-func setupSignalHandler() {
+func setupSignalHandler(cleanup func()) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGSEGV)
 
 	go func() {
 		sig := <-sigs
-		log.Error().Msgf("Received signal: %v\n", sig)
+		log.Info().Msgf("Received signal: %v\n", sig)
 
-		// Print stack trace
-		debug.PrintStack()
+		cleanup()
 
 		// Exit if necessary
 		os.Exit(1)
 	}()
 }
+
 func isPunctuationMarkAtEnd(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -93,12 +93,11 @@ func textToSpeechAndEncodeRoutine(tts synthesizer.Synthesizer, textCh <-chan str
 		}
 	}
 }
-
-func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesCh chan []byte) {
+func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesChan chan []byte) {
 	log.Info().Msgf("playAudioChunksRoutine started")
 
 	i := 0
-	for rawAudioBytes := range rawAudioBytesCh {
+	for rawAudioBytes := range rawAudioBytesChan {
 		i += 1
 		if i <= 2 { // Doing 2, cause first is filler word.
 			log.Warn().Int("num", i).Msg("TRACING HACK: tts received")
@@ -133,9 +132,10 @@ func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesCh ch
 
 		log.Debug().Dur("duration", time.Since(startTime)).Msg("player DONE")
 	}
+	log.Info().Msgf("playAudioChunksRoutine finished")
 }
 
-func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan chan models.AudioData, finalTranscriptChan chan string, earlyTranscriptChan chan string) {
+func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan chan models.AudioData, textChunksChan chan models.AudioData, earlyTranscriptChan chan string) string {
 	log.Info().Msgf("transcribeAudioRoutine started")
 	routineStart := time.Now()
 	sendEarlyTranscript := true
@@ -146,17 +146,19 @@ func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan
 		audioChunk.Trace.ReceivedAt = time.Now()
 
 		recordingBytes := audioChunk.ByteData
+		// TODO: This should reset
 		previousWords := transcriptBuilder.String()
 		transcript, err := transcriber.SendAudio(bytes.NewReader(recordingBytes), "wav", previousWords)
 		if err != nil {
 			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chunk")
 			continue
 		}
-		transcriptBuilder.WriteString(transcript + " ")
-
+		audioChunk.Text = transcript
 		audioChunk.Trace.ProcessedAt = time.Now()
 		audioChunk.Trace.Processor = "transcribe_open_ai_whisper"
 		audioChunk.Trace.Log()
+
+		textChunksChan <- audioChunk
 
 		if sendEarlyTranscript && time.Since(routineStart).Seconds() > 7 {
 			sendEarlyTranscript = false
@@ -167,7 +169,8 @@ func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan
 
 	finalTranscript := transcriptBuilder.String()
 	log.Info().Msgf("transcribeAudioRoutine ended with finalTranscript %s", finalTranscript)
-	finalTranscriptChan <- finalTranscript
+	close(textChunksChan)
+	return finalTranscript
 }
 
 func compareToFullTranscript(transcriber transcriber.Transcriber, wavBytes []byte, finalTranscriptFromSlices string) {
@@ -182,26 +185,33 @@ func fillerWordRoutine(chatAgent agent.ChatAgent, tts synthesizer.Synthesizer, e
 	earlyTranscript := <-earlyTranscriptChan
 	log.Info().Msgf("fillerWordRoutine received earlyTranscript %s", earlyTranscript)
 
-	//prompt := fmt.Sprintf("I want to respond to this input text with a few filler words; example 1: Hm, San Francisco... Example 2: Alright, your fathers birthday... Input text: %s", earlyTranscript)
-	//prompt := fmt.Sprintf("Generate a few filler words with mentioning the topic to be used while i am thinking. Only output the filler words, up to 5 words. The input text: %s", earlyTranscript)
-	//fillerPrompt := fmt.Sprintf("generate the most appropriate filler word to this transcript, only output a single word: %s", earlyTranscript)
-	//fillerPromptResult := make(chan string, 1000)
-	//go executeChatRequest(client, "gpt-3.5-turbo", fillerPrompt, fillerPromptResult)
-	//// go executeChatRequest(client, "gpt-4", prompt, promptResult)
-	//fillerWords := "... "
-	//for token := range fillerPromptResult {
-	//	fillerWords += token
-	//}
-	//fillerWords += " "
+	fillerWords := "Uhm, ..."
+	if len(earlyTranscript) < 20 {
+		log.Debug().Msg("earlyTranscript too short")
+	} else {
+		//prompt := fmt.Sprintf("I want to respond to this input text with a few filler words; example 1: Hm, San Francisco... Example 2: Alright, your fathers birthday... Input text: %s", earlyTranscript)
+		//prompt := fmt.Sprintf("Generate a few filler words with mentioning the topic to be used while i am thinking. Only output the filler words, up to 5 words. The input text: %s", earlyTranscript)
+		//fillerPrompt := fmt.Sprintf("generate the most appropriate filler word to this transcript, only output a single word: %s", earlyTranscript)
+		//fillerPromptResult := make(chan string, 1000)
+		//go executeChatRequest(client, "gpt-3.5-turbo", fillerPrompt, fillerPromptResult)
+		//// go executeChatRequest(client, "gpt-4", prompt, promptResult)
+		//fillerWords := "... "
+		//for token := range fillerPromptResult {
+		//	fillerWords += token
+		//}
+		//fillerWords += " "
 
-	fillerWords := "hmm Got it, "
-	topicPrompt := fmt.Sprintf("etract conversation title in 1-4 words from this transcript: %s", earlyTranscript)
-	topicPromptResult := make(chan string, 1000)
-	go dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, topicPrompt, topicPromptResult))
-	for token := range topicPromptResult {
-		fillerWords += token
+		fillerWords = "Hmm got it, "
+		topicPrompt := fmt.Sprintf("etract conversation title in 1-4 words from this transcript: %s", earlyTranscript)
+		topicPromptResult := make(chan string, 1000)
+		go func() {
+			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, topicPrompt, topicPromptResult))
+		}()
+		for token := range topicPromptResult {
+			fillerWords += token
+		}
+		fillerWords += "... ."
 	}
-	fillerWords += "... ."
 
 	// Speed 1.0, filler words are more natural to produce slow.
 	fillerWordAudioBytes, err := tts.CreateSpeech(fillerWords, 1.0)
@@ -214,11 +224,46 @@ func fillerWordRoutine(chatAgent agent.ChatAgent, tts synthesizer.Synthesizer, e
 	log.Info().Msgf("fillerWordRoutine END")
 }
 
+// Goroutine to handle user input
+func userInterruptRoutine(stopChan chan struct{}) {
+	fmt.Println("Press Enter to stop output and make new input...")
+	_, err := fmt.Scanln()
+	dbg(err)
+	close(stopChan) // Send interrupt signal
+}
+
+func playTTSUntilInterruptRoutine(ttsOutputBuffer chan []byte, audioToPlayChan chan []byte) {
+	log.Info().Msg("playTTSUntilInterruptRoutine START")
+	interruptChan := make(chan struct{})
+	go userInterruptRoutine(interruptChan)
+
+	// Main loop for processing ttsOutputBuffer
+	for {
+		select {
+		case ttsOutput, ok := <-ttsOutputBuffer:
+			if !ok {
+				log.Info().Msg("ttsOutputBuffer closed. playTTSUntilInterruptRoutine STOP")
+				return
+			}
+			select {
+			case audioToPlayChan <- ttsOutput:
+				// Process the audio
+			case <-interruptChan:
+				log.Info().Msg("Interrupt received. playTTSUntilInterruptRoutine STOP")
+				return
+			}
+		case <-interruptChan:
+			log.Info().Msg("Interrupt received. playTTSUntilInterruptRoutine STOP")
+			return
+		}
+	}
+	// TODO: ideally we should call outputAudio.Stop() -- to not wait until the entire sentence is done
+}
+
 // Based off their Python version of the code https://cookbook.openai.com/examples/how_to_stream_completions
 // Translated with GPT-4: https://chat.openai.com/c/c723eeaa-2c24-42c2-aabb-0f5582d0f031
 // Using https://github.com/sashabaranov/go-openai/blob/d6f3bdcdac9172ab5248d6be8c3e1761446a434c/chat_stream.go#L62
 func main() {
-	setupSignalHandler()
 	setupStart := time.Now()
 	// Set up zerolog with custom output to include milliseconds in the timestamp
 	log.Logger = zerolog.New(zerolog.ConsoleWriter{
@@ -242,62 +287,84 @@ func main() {
 	chatAgent := agent.NewOpenAIChatAgent(client)
 	tts := synthesizer.NewOpenAITTS(openAIAPIKey)
 
-	// About 200ms
-	audioInput, err := audioio.NewMicrophone()
-	if err != nil {
-		log.Panic().Err(err).Msgf("cannot init microphone")
-	}
 	audioOutput, err := audioio.NewSpeakers(OpenAiSampleRate, 2)
-	if err != nil {
-		log.Panic().Err(err).Msgf("cannot init speakers")
-	}
+	ftl(err)
+
 	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
 	// ==== SETUP DONE
 
-	audioChunksChan := make(chan models.AudioData, 100000) // TODO: feels to be allocating too much but shrug
-	finalTranscriptChan := make(chan string, 1)
-	earlyTranscriptChan := make(chan string, 1)
-	chatOutputChan := make(chan string, 100000)
-	rawAudioBytesChan := make(chan []byte, 100000)
-	go transcribeAudioRoutine(whisper, audioChunksChan, finalTranscriptChan, earlyTranscriptChan)
-	go fillerWordRoutine(chatAgent, tts, earlyTranscriptChan, rawAudioBytesChan)
+	runLoop := true
+	setupSignalHandler(func() {
+		runLoop = false
+	})
 
-	err = audioInput.StartRecording(audioChunksChan)
-	if err != nil {
-		log.Error().Err(err).Msg("malgo record failed")
-		return
+	i := 0
+	audioToPlayChan := make(chan []byte) // non-buffer
+	go playAudioChunksRoutine(audioOutput, audioToPlayChan)
+
+	allPrompts := ""
+	for runLoop {
+		i++
+		inputAudioChunksChan := make(chan models.AudioData, 100000)
+		inputTextChunksChan := make(chan models.AudioData, 100000)
+		chatOutputChan := make(chan string, 100000)
+		ttsOutputBuffer := make(chan []byte, 3)
+
+		// TODO: feels to be allocating too much but shrug
+		// finalTranscriptChan := make(chan string, 1)
+		earlyTranscriptChan := make(chan string, 1)
+		go fillerWordRoutine(chatAgent, tts, earlyTranscriptChan, ttsOutputBuffer)
+
+		go transcribeAudioRoutine(whisper, inputAudioChunksChan, inputTextChunksChan, earlyTranscriptChan)
+
+		audioInput, err := audioio.NewMicrophone() // About 200ms
+		ftl(err)
+		err = audioInput.StartRecording(inputAudioChunksChan)
+		ftl(err)
+
+		fmt.Println("Press Enter to submit your input...")
+		_, err = fmt.Scanln()
+		dbg(err)
+
+		entireWavRecording, err := audioInput.StopRecording()
+		dbg(err)
+		// For debug purposes write the output to a real file so we can replay it.
+		dbg(os.WriteFile(fmt.Sprintf("output/entire-recording-%d.wav", i), entireWavRecording, 0644))
+
+		chatPrompt := ""
+		for inputTextChunk := range inputTextChunksChan {
+			chatPrompt += inputTextChunk.Text
+		}
+		allPrompts += chatPrompt
+		// Just for debug
+		go compareToFullTranscript(whisper, entireWavRecording, chatPrompt)
+
+		// Documentation for the chat and rawAudio routines intent / design:
+		// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
+		go textToSpeechAndEncodeRoutine(tts, chatOutputChan, ttsOutputBuffer)
+
+		// prompt := "Strep throat recovery timeline in 100 words"
+		// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
+		// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
+		go func() {
+			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, allPrompts, chatOutputChan))
+		}()
+		// TODO: Use the assistant, allPrompts is too hacky lol
+
+		playTTSUntilInterruptRoutine(ttsOutputBuffer, audioToPlayChan)
 	}
-
-	// TODO(P0, ux): Get this through VAD when we stop talking
-	fmt.Println("Press Enter to stop recording...")
-	_, err = fmt.Scanln()
-
-	entireWavRecording, err := audioInput.StopRecording()
-	if err != nil {
-		log.Error().Err(err).Msg("audio input stop recording")
-	}
-	// For debug purposes write the output to a real file so we can replay it.
-	dbg(os.WriteFile("output/entire-recording.wav", entireWavRecording, 0644))
-
-	// Documentation for the chat and rawAudio routines intent / design:
-	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
-	go textToSpeechAndEncodeRoutine(tts, chatOutputChan, rawAudioBytesChan)
-	go playAudioChunksRoutine(audioOutput, rawAudioBytesChan)
-
-	chatPrompt := <-finalTranscriptChan
-	go compareToFullTranscript(whisper, entireWavRecording, chatPrompt)
-	// prompt := "Strep throat recovery timeline in 100 words"
-	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
-	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
-	dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, chatPrompt, chatOutputChan))
-
-	// TODO: Better wait mechanism.
-	time.Sleep(10 * time.Second)
-	dbg(audioOutput.Stop()) // Don't really have to but want to try if it works.
 }
 
 func dbg(err error) {
 	if err != nil {
 		log.Debug().Err(err).Msg("sth non-essential failed")
+		debug.PrintStack()
+	}
+}
+
+func ftl(err error) {
+	if err != nil {
+		log.Fatal().Err(err).Msg("sth essential failed")
+		debug.PrintStack()
 	}
 }
