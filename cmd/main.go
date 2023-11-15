@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/hajimehoshi/go-mp3"
 	"github.com/joho/godotenv"
+	"github.com/petrzlen/vocode-golang/pkg/agent"
 	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/sashabaranov/go-openai"
@@ -48,73 +49,6 @@ func setupSignalHandler() {
 		// Exit if necessary
 		os.Exit(1)
 	}()
-}
-
-func executeChatRequest(client *openai.Client, model string, prompt string, outputChan chan string) {
-	startTime := time.Now()
-	lastDataReceivedPrintoutTime := time.Now()
-
-	// Create a chat completion request
-	chatRequest := openai.ChatCompletionRequest{
-		// Model: "gpt-3.5-turbo",
-		Model: model,
-		Messages: []openai.ChatCompletionMessage{
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		},
-		Temperature: 0,
-	}
-	log.Info().Str("prompt", prompt).Str("model", chatRequest.Model).Float32("temperature", chatRequest.Temperature).Msg("executeChatRequest")
-
-	// Create a chat completion stream
-	ctx := context.Background()
-	completionStream, createStreamErr := client.CreateChatCompletionStream(ctx, chatRequest)
-	if createStreamErr != nil {
-		log.Panic().Msgf("Failed to create chat completion stream: %v", createStreamErr)
-	}
-
-	var contentBuilder strings.Builder
-	var debugChunkBuilder strings.Builder
-
-	firstContent := true
-	for {
-		response, streamRecvErr := completionStream.Recv()
-		if firstContent {
-			log.Warn().Dur("latency", time.Since(startTime)).Msg("TRACING HACK: first chat completion received")
-			firstContent = false
-		}
-
-		// Process the response
-		for _, choice := range response.Choices {
-			content := choice.Delta.Content
-			outputChan <- content
-			contentBuilder.WriteString(content)
-			debugChunkBuilder.WriteString(content)
-
-			if time.Since(lastDataReceivedPrintoutTime) >= time.Second {
-				lastDataReceivedPrintoutTime = time.Now() // Update the last printout time
-				lastChunk := debugChunkBuilder.String()
-				debugChunkBuilder.Reset()
-				log.Debug().Float64("time_elapsed", time.Since(startTime).Seconds()).Str("last_content", lastChunk).Msgf("ChatCompletionStream Data Status")
-			}
-		}
-
-		// We only handle the error at the end - since we can get io.EOF with the last token.
-		if streamRecvErr != nil {
-			if errors.Is(streamRecvErr, io.EOF) {
-				break // Stream closed, exit loop
-			}
-			log.Error().Msgf("Error reading from stream, closing: %v\n", streamRecvErr)
-			break
-		}
-	}
-
-	close(outputChan)
-	result := contentBuilder.String()
-	log.Info().Msgf("Full response received %.2f seconds after request", time.Since(startTime).Seconds())
-	log.Info().Msgf("Full conversation received: %s", result)
 }
 
 // This is to by-pass not-yet-implemented APIs in go-openai
@@ -372,7 +306,7 @@ func compareToFullTranscript(client *openai.Client, wavBytes []byte, finalTransc
 	log.Info().Str("full_transcript", fullResult).Str("sliced_together_transcript", finalTranscriptFromSlices).Msg("comparing full transcript to from slices")
 }
 
-func fillerWordRoutine(client *openai.Client, openAIAPIKey string, earlyTranscriptChan chan string, audioOutputChan chan []byte) {
+func fillerWordRoutine(chatAgent agent.ChatAgent, openAIAPIKey string, earlyTranscriptChan chan string, audioOutputChan chan []byte) {
 	log.Info().Msgf("fillerWordRoutine START")
 	// This is the 5-10
 	earlyTranscript := <-earlyTranscriptChan
@@ -393,7 +327,7 @@ func fillerWordRoutine(client *openai.Client, openAIAPIKey string, earlyTranscri
 	fillerWords := "hmm Got it, "
 	topicPrompt := fmt.Sprintf("etract conversation title in 1-4 words from this transcript: %s", earlyTranscript)
 	topicPromptResult := make(chan string, 1000)
-	go executeChatRequest(client, "gpt-3.5-turbo", topicPrompt, topicPromptResult)
+	go dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, topicPrompt, topicPromptResult))
 	for token := range topicPromptResult {
 		fillerWords += token
 	}
@@ -434,6 +368,7 @@ func main() {
 		log.Panic().Msgf("OPEN_AI_API_KEY is not set")
 	}
 	client := openai.NewClient(openAIAPIKey)
+	chatAgent := agent.NewOpenAIChatAgent(client)
 
 	// About 200ms
 	audioInput, err := audioio.NewMicrophone()
@@ -453,7 +388,7 @@ func main() {
 	chatOutputChan := make(chan string, 100000)
 	rawAudioBytesChan := make(chan []byte, 100000)
 	go transcribeAudioRoutine(client, audioChunksChan, finalTranscriptChan, earlyTranscriptChan)
-	go fillerWordRoutine(client, openAIAPIKey, earlyTranscriptChan, rawAudioBytesChan)
+	go fillerWordRoutine(chatAgent, openAIAPIKey, earlyTranscriptChan, rawAudioBytesChan)
 
 	err = audioInput.StartRecording(audioChunksChan)
 	if err != nil {
@@ -482,7 +417,7 @@ func main() {
 	// prompt := "Strep throat recovery timeline in 100 words"
 	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
 	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
-	executeChatRequest(client, "gpt-4", chatPrompt, chatOutputChan)
+	dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, chatPrompt, chatOutputChan))
 
 	// TODO: Better wait mechanism.
 	time.Sleep(10 * time.Second)
