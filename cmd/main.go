@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"github.com/hajimehoshi/go-mp3"
@@ -11,11 +10,11 @@ import (
 	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/petrzlen/vocode-golang/pkg/synthesizer"
+	"github.com/petrzlen/vocode-golang/pkg/transcriber"
 	"github.com/sashabaranov/go-openai"
 	"io"
 	"os"
 	"os/signal"
-	"regexp"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -136,62 +135,7 @@ func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesCh ch
 	}
 }
 
-// removeNonEnglishAndMBC removes non-English characters and the "MBC" string from the input text.
-// TODO: HACK, somewhat "silence" is transcribed with random Chinese characters for example:
-// MBC 뉴스 이덕영입니다. Yeah, tell me. a bit about uh, written  in 100 words.  MBC 뉴스 이덕영입니다.
-func removeNonEnglishAndMBC(text string) string {
-	// Regular expression to match non-English characters.
-	nonEnglishRegex := regexp.MustCompile(`[^\x00-\x7F]+`)
-	text = nonEnglishRegex.ReplaceAllString(text, "")
-
-	// Remove all occurrences of "MBC".
-	text = strings.ReplaceAll(text, "MBC", "")
-
-	return text
-}
-
-// TODO(P1, latency): Figure out by how much mp3 is faster than .WAV
-//
-//	3 tests on a 260KB wav vs 67KB mp3 it seems maybe 1100ms vs 1000ms, but there was a run when wav beat mp3 :/
-func transcribeAudio(client *openai.Client, input io.Reader, fileExtension string, prompt string) (result string, err error) {
-	startTime := time.Now()
-	// TODO(P0, ux): Try running Whisper locally for quicker transcription speeds (and maybe no filler words needed).
-	req := openai.AudioRequest{
-		Model:    "whisper-1",
-		Reader:   input,
-		FilePath: fmt.Sprintf("this-file-does-not-exist-just-needs-extension.%s", fileExtension),
-		// FilePath: "output/tell-me-about-ba.mp3",
-		// NOTE: Giving the model the previous words improves accuracy.
-		// Whisper can take up to 244 tokens, if more are passed than only the last are used.
-		// TODO(P0, ux): Adding prompt with previous words should improve transcription
-		// Language: "en",
-		Prompt: prompt,
-	}
-
-	log.Debug().Str("model", req.Model).Str("prompt", prompt).Msg("create transcription request")
-	resp, err := client.CreateTranscription(context.Background(), req)
-	if err != nil {
-		err = fmt.Errorf("cannot create transcription %w", err)
-		return
-	}
-
-	//var contentBuilder strings.Builder
-	//for _, segment := range resp.Segments {
-	//	contentBuilder.WriteString(segment.Text)
-	//}
-	//result = contentBuilder.String()
-
-	// TODO: Better "silence" detection
-	result = removeNonEnglishAndMBC(resp.Text)
-	if result != resp.Text {
-		log.Info().Str("original_text", resp.Text).Str("processed_text", result).Msg("transcription post-processing removed some text")
-	}
-
-	log.Debug().Str("transcription", result).Dur("time_elapsed", time.Since(startTime)).Msg("received transcription")
-	return
-}
-
-func transcribeAudioRoutine(client *openai.Client, audioChunksChan chan models.AudioData, finalTranscriptChan chan string, earlyTranscriptChan chan string) {
+func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan chan models.AudioData, finalTranscriptChan chan string, earlyTranscriptChan chan string) {
 	log.Info().Msgf("transcribeAudioRoutine started")
 	routineStart := time.Now()
 	sendEarlyTranscript := true
@@ -203,7 +147,7 @@ func transcribeAudioRoutine(client *openai.Client, audioChunksChan chan models.A
 
 		recordingBytes := audioChunk.ByteData
 		previousWords := transcriptBuilder.String()
-		transcript, err := transcribeAudio(client, bytes.NewReader(recordingBytes), "wav", previousWords)
+		transcript, err := transcriber.SendAudio(bytes.NewReader(recordingBytes), "wav", previousWords)
 		if err != nil {
 			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chunk")
 			continue
@@ -226,8 +170,8 @@ func transcribeAudioRoutine(client *openai.Client, audioChunksChan chan models.A
 	finalTranscriptChan <- finalTranscript
 }
 
-func compareToFullTranscript(client *openai.Client, wavBytes []byte, finalTranscriptFromSlices string) {
-	fullResult, err := transcribeAudio(client, bytes.NewReader(wavBytes), "wav", "")
+func compareToFullTranscript(transcriber transcriber.Transcriber, wavBytes []byte, finalTranscriptFromSlices string) {
+	fullResult, err := transcriber.SendAudio(bytes.NewReader(wavBytes), "wav", "")
 	dbg(err)
 	log.Info().Str("full_transcript", fullResult).Str("sliced_together_transcript", finalTranscriptFromSlices).Msg("comparing full transcript to from slices")
 }
@@ -294,6 +238,7 @@ func main() {
 		log.Panic().Msgf("OPEN_AI_API_KEY is not set")
 	}
 	client := openai.NewClient(openAIAPIKey)
+	whisper := transcriber.NewOpenAIWhisper(client)
 	chatAgent := agent.NewOpenAIChatAgent(client)
 	tts := synthesizer.NewOpenAITTS(openAIAPIKey)
 
@@ -314,7 +259,7 @@ func main() {
 	earlyTranscriptChan := make(chan string, 1)
 	chatOutputChan := make(chan string, 100000)
 	rawAudioBytesChan := make(chan []byte, 100000)
-	go transcribeAudioRoutine(client, audioChunksChan, finalTranscriptChan, earlyTranscriptChan)
+	go transcribeAudioRoutine(whisper, audioChunksChan, finalTranscriptChan, earlyTranscriptChan)
 	go fillerWordRoutine(chatAgent, tts, earlyTranscriptChan, rawAudioBytesChan)
 
 	err = audioInput.StartRecording(audioChunksChan)
@@ -340,7 +285,7 @@ func main() {
 	go playAudioChunksRoutine(audioOutput, rawAudioBytesChan)
 
 	chatPrompt := <-finalTranscriptChan
-	go compareToFullTranscript(client, entireWavRecording, chatPrompt)
+	go compareToFullTranscript(whisper, entireWavRecording, chatPrompt)
 	// prompt := "Strep throat recovery timeline in 100 words"
 	// prompt := "give me first 30 numbers as a sequence 1, 2, .. 30"
 	// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
