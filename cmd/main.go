@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ebitengine/oto/v3"
 	"github.com/hajimehoshi/go-mp3"
 	"github.com/joho/godotenv"
 	"github.com/petrzlen/vocode-golang/pkg/input_device"
 	"github.com/petrzlen/vocode-golang/pkg/models"
+	"github.com/petrzlen/vocode-golang/pkg/output_device"
 	"github.com/sashabaranov/go-openai"
 	"io"
 	"net/http"
@@ -236,25 +236,7 @@ func textToSpeechAndEncodeRoutine(openAIAPIKey string, textCh <-chan string, raw
 	}
 }
 
-func setupOtoContext(sampleRate int, channelCount int) *oto.Context {
-	op := &oto.NewContextOptions{
-		SampleRate:   sampleRate,
-		ChannelCount: channelCount,
-		Format:       oto.FormatSignedInt16LE,
-	}
-
-	// Remember that you should **not** create more than one context
-	log.Info().Msgf("setupOtoPlayer - will wait until ready")
-	otoCtx, readyChan, err := oto.NewContext(op)
-	if err != nil {
-		log.Panic().Err(err)
-	}
-	<-readyChan // Wait for the audio hardware to be ready
-	log.Info().Msgf("setupOtoPlayer - context ready")
-	return otoCtx
-}
-
-func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
+func playAudioChunksRoutine(audioOutput output_device.AudioOutputDevice, rawAudioBytesCh chan []byte) {
 	log.Info().Msgf("playAudioChunksRoutine started")
 
 	i := 0
@@ -280,22 +262,17 @@ func playAudioChunksRoutine(otoCtx *oto.Context, rawAudioBytesCh chan []byte) {
 			continue
 		}
 		log.Debug().Int("sample_rate", decodedMp3.SampleRate()).Int64("byte_size", decodedMp3.Length()).Msg("player START")
-		player := otoCtx.NewPlayer(decodedMp3) // Sub-millisecond time
-		player.Play()
+
+		waitTilDone, err := audioOutput.Play(decodedMp3) // Sub-millisecond time
 		if i == 1 {
 			log.Warn().Msg("TRACING HACK: first playback started")
 		}
-
-		// Wait for the chunk to finish playing
-		for player.IsPlaying() {
-			// TODO(P0, ux): We would need to handle interrupts here
-			time.Sleep(time.Millisecond)
-		}
-		// Close the player when done
-		err = player.Close()
 		if err != nil {
-			log.Error().Err(err).Msg("player.Close failed")
+			log.Error().Err(err).Msgf("cannot play decoded mp3")
+		} else {
+			waitTilDone.Wait()
 		}
+
 		log.Debug().Dur("duration", time.Since(startTime)).Msg("player DONE")
 	}
 }
@@ -421,6 +398,7 @@ func fillerWordRoutine(client *openai.Client, openAIAPIKey string, earlyTranscri
 	for token := range topicPromptResult {
 		fillerWords += token
 	}
+	fillerWords += "... ."
 
 	// Speed 1.0, filler words are more natural to produce slow.
 	fillerWordAudioBytes, err := sendTTSRequest(openAIAPIKey, fillerWords, 1.0)
@@ -463,8 +441,10 @@ func main() {
 	if err != nil {
 		log.Panic().Err(err).Msgf("cannot init microphone")
 	}
-
-	otoCtx := setupOtoContext(OpenAiSampleRate, 2)
+	audioOutput, err := output_device.NewSpeakers(OpenAiSampleRate, 2)
+	if err != nil {
+		log.Panic().Err(err).Msgf("cannot init speakers")
+	}
 	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
 	// ==== SETUP DONE
 
@@ -496,7 +476,7 @@ func main() {
 	// Documentation for the chat and rawAudio routines intent / design:
 	// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
 	go textToSpeechAndEncodeRoutine(openAIAPIKey, chatOutputChan, rawAudioBytesChan)
-	go playAudioChunksRoutine(otoCtx, rawAudioBytesChan)
+	go playAudioChunksRoutine(audioOutput, rawAudioBytesChan)
 
 	chatPrompt := <-finalTranscriptChan
 	go compareToFullTranscript(client, entireWavRecording, chatPrompt)
@@ -507,6 +487,7 @@ func main() {
 
 	// TODO: Better wait mechanism.
 	time.Sleep(10 * time.Second)
+	dbg(audioOutput.Stop()) // Don't really have to but want to try if it works.
 }
 
 func dbg(err error) {
