@@ -6,8 +6,6 @@ import (
 )
 
 type Trace struct {
-	DataName string
-
 	CreatedAt time.Time
 	Creator   string
 
@@ -19,15 +17,39 @@ type Trace struct {
 }
 
 func (t Trace) Log() {
-	log.Trace().Time("created_at", t.CreatedAt).Str("creator", t.Creator).Time("processed_at", t.ProcessedAt).Str("processor", t.Processor).Dur("dur_to_process", t.ProcessedAt.Sub(t.CreatedAt)).Msgf("trace of %s", t.DataName)
+	log.Trace().Time("created_at", t.CreatedAt).Str("creator", t.Creator).Time("processed_at", t.ProcessedAt).Str("processor", t.Processor).Dur("dur_to_process", t.ProcessedAt.Sub(t.CreatedAt)).Msgf("tracing")
 }
 
+type AudioDataEvent int
+
+// Declare constants with the custom type. These are your enum values.
+const (
+	AudioInput AudioDataEvent = iota
+	AudioOutput
+	SubmitPrompt
+)
+
 type AudioData struct {
-	ByteData []byte
-	Format   string
-	Length   time.Duration
-	Text     string // text representation
-	Trace    Trace
+	EventType AudioDataEvent
+	ByteData  []byte
+	Format    string
+	Length    time.Duration
+	Text      string // text representation
+	Trace     Trace
+}
+
+func NewAudioDataSubmit(creator string) AudioData {
+	return AudioData{
+		EventType: SubmitPrompt,
+		Trace:     NewTrace(creator),
+	}
+}
+
+func NewTrace(creator string) Trace {
+	return Trace{
+		CreatedAt: time.Now(),
+		Creator:   creator,
+	}
 }
 
 type Message struct {

@@ -57,6 +57,10 @@ func (o *openAIWhisper) SendAudio(input io.Reader, fileExtension string, prompt 
 		log.Info().Str("original_text", resp.Text).Str("processed_text", result).Msg("transcription post-processing removed some text")
 	}
 
+	// TODO(P1, ux): Sometimes it really hangs time_elapsed=27332.972959 transcription="Tell me about San Francisco."
+	//   For such we should either:
+	//    * Run Whisper locally to have more control over it
+	//    * Generate some audio output
 	log.Debug().Str("transcription", result).Dur("time_elapsed", time.Since(startTime)).Msg("received transcription")
 	return
 }

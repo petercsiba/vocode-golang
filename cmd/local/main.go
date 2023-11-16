@@ -135,46 +135,6 @@ func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesChan 
 	log.Info().Msgf("playAudioChunksRoutine finished")
 }
 
-func transcribeAudioRoutine(transcriber transcriber.Transcriber, audioChunksChan chan models.AudioData, textChunksChan chan models.AudioData, earlyTranscriptChan chan string) string {
-	log.Info().Msgf("transcribeAudioRoutine started")
-	routineStart := time.Now()
-	sendEarlyTranscript := true
-
-	// Replace 'client' and 'transcribeAudio' with your actual client and function
-	var transcriptBuilder strings.Builder
-	for audioChunk := range audioChunksChan {
-		audioChunk.Trace.ReceivedAt = time.Now()
-
-		recordingBytes := audioChunk.ByteData
-		// TODO: This should reset
-		previousWords := transcriptBuilder.String()
-		transcript, err := transcriber.SendAudio(bytes.NewReader(recordingBytes), "wav", previousWords)
-		if err != nil {
-			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chunk")
-			continue
-		}
-		transcriptBuilder.WriteString(transcript)
-		transcriptBuilder.WriteString(" ")
-		audioChunk.Text = transcript
-		audioChunk.Trace.ProcessedAt = time.Now()
-		audioChunk.Trace.Processor = "transcribe_open_ai_whisper"
-		audioChunk.Trace.Log()
-
-		textChunksChan <- audioChunk
-
-		if sendEarlyTranscript && time.Since(routineStart).Seconds() > 7 {
-			sendEarlyTranscript = false
-			log.Info().Msgf("transcribeAudioRoutine sending earlyTranscript")
-			earlyTranscriptChan <- transcriptBuilder.String()
-		}
-	}
-
-	finalTranscript := transcriptBuilder.String()
-	log.Info().Msgf("transcribeAudioRoutine ended with finalTranscript %s", finalTranscript)
-	close(textChunksChan)
-	return finalTranscript
-}
-
 func compareToFullTranscript(transcriber transcriber.Transcriber, wavBytes []byte, finalTranscriptFromSlices string) {
 	fullResult, err := transcriber.SendAudio(bytes.NewReader(wavBytes), "wav", "")
 	dbg(err)
@@ -297,25 +257,24 @@ func main() {
 		runLoop = false
 	})
 
-	i := 0
 	audioToPlayChan := make(chan []byte) // non-buffer
+	inputAudioChunksChan := make(chan models.AudioData, 100000)
+	inputTextChunksChan := make(chan models.AudioData, 100000)
+	earlyTranscriptChan := make(chan string, 10)
 	go playAudioChunksRoutine(audioOutput, audioToPlayChan)
+	go transcriber.TranscribeAudioRoutine(whisper, inputAudioChunksChan, inputTextChunksChan, earlyTranscriptChan)
 
 	fullConvo := &models.Conversation{}
 
+	i := 0
 	for runLoop {
 		i++
-		inputAudioChunksChan := make(chan models.AudioData, 100000)
-		inputTextChunksChan := make(chan models.AudioData, 100000)
 		chatOutputChan := make(chan string, 100000)
 		ttsOutputBuffer := make(chan models.AudioData, 3)
 
 		// TODO: feels to be allocating too much but shrug
 		// finalTranscriptChan := make(chan string, 1)
-		earlyTranscriptChan := make(chan string, 1)
 		go fillerWordRoutine(chatAgent, tts, earlyTranscriptChan, ttsOutputBuffer)
-
-		go transcribeAudioRoutine(whisper, inputAudioChunksChan, inputTextChunksChan, earlyTranscriptChan)
 
 		audioInput, err := audioio.NewMicrophone() // About 200ms
 		ftl(err)
@@ -328,11 +287,15 @@ func main() {
 
 		entireWavRecording, err := audioInput.StopRecording()
 		dbg(err)
+
 		// For debug purposes write the output to a real file so we can replay it.
 		dbg(os.WriteFile(fmt.Sprintf("output/entire-recording-%d.wav", i), entireWavRecording, 0644))
 
 		chatPrompt := ""
 		for inputTextChunk := range inputTextChunksChan {
+			if inputTextChunk.EventType == models.SubmitPrompt {
+				break
+			}
 			chatPrompt += inputTextChunk.Text + " "
 		}
 		fullConvo.Add("user", chatPrompt)

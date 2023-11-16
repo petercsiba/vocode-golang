@@ -116,6 +116,7 @@ func (m *microphone) StartRecording(recordingChan chan models.AudioData) (err er
 	return
 }
 
+// StopRecording should really just be "PauseRecording"
 func (m *microphone) StopRecording() (entireRecording []byte, err error) {
 	log.Info().Dur("recording_duration", time.Since(m.recordingStart)).Msg("malgo STOP recording")
 	log.Warn().Msg("TRACING HACK: malgo STOP")
@@ -128,15 +129,16 @@ func (m *microphone) StopRecording() (entireRecording []byte, err error) {
 	// * We do NOT need to send the end silence for transcription (can give us 500-1000ms).
 
 	// Since we chunk up stuff - there might be some leftovers.
-	// TODO(P0, ux): This is a major contributor to the Stop to Playback latency
+	// TODO(P0, ux): Creating an audio chunk after Stop is hit is a major contributor to the prompt response latency
 	m.maybeFlushBuffer(true)
 
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
 	entireRecording, err = audio_utils.ConvertTwoByteSamplesToWav(m.pSampleData, m.getSampleRate(), m.getNumChannels())
 
-	log.Info().Msg("closing recordingChan from StopRecording")
-	close(m.recordingChan)
+	m.recordingChan <- models.NewAudioDataSubmit("microphone.user_stopped_recording")
+	// log.Info().Msg("closing recordingChan from StopRecording")
+	// close(m.recordingChan)
 
 	m.malgoContext.Free()
 	return
@@ -232,14 +234,11 @@ func (m *microphone) maybeFlushBuffer(isEnd bool) int {
 	}
 
 	audioData := models.AudioData{
-		ByteData: wavData,
-		Format:   "wav",
-		Length:   time.Duration(float64(len(wavData)) / float64(sampleRate)),
-		Trace: models.Trace{
-			DataName:  "audio_data",
-			CreatedAt: time.Now(),
-			Creator:   "microphone_client",
-		},
+		EventType: models.AudioInput,
+		ByteData:  wavData,
+		Format:    "wav",
+		Length:    time.Duration(float64(len(wavData)) / float64(sampleRate)),
+		Trace:     models.NewTrace("microphone_client"),
 	}
 	m.recordingChan <- audioData
 	dbg(os.WriteFile(fmt.Sprintf("output/%d-%d.wav", startIndex, endIndex), wavData, 0644))

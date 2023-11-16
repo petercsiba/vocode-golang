@@ -46,11 +46,7 @@ func (o *openAITTS) CreateSpeech(text string, speed float64) (audioOutput models
 		Format:   "wav",
 		Length:   0, // TODO
 		Text:     text,
-		Trace: models.Trace{
-			DataName:  "audio_output",
-			CreatedAt: time.Now(),
-			Creator:   "openAITTS.CreateSpeech",
-		},
+		Trace:    models.NewTrace("openAITTS.CreateSpeech"),
 	}
 
 	return
