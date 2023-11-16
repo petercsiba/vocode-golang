@@ -113,6 +113,7 @@ func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesChan 
 			log.Debug().Msgf("cannot write debug file %s", debugFilename)
 		}
 
+		// TODO: Can we just Play the rawAudioBytes in here?
 		decodedMp3, decodedMp3Err := mp3.NewDecoder(bytes.NewReader(rawAudioBytes))
 		if decodedMp3Err != nil && !errors.Is(decodedMp3Err, io.EOF) {
 			log.Error().Err(decodedMp3Err).Msg("mp3.NewDecoder failed, skipping chunk")
