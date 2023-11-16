@@ -54,7 +54,54 @@ func ConvertOneByteMulawSamplesToWav(byteData []byte, inputSampleRate, outputSam
 	return convertIntSamplesToWav(inputBuffer, outputSampleRate, numChannels, audioFormat)
 }
 
+func convertBytesToReadSeeker(byteData []byte) io.ReadSeeker {
+	// Create a new in-memory file system
+	fs := afero.NewMemMapFs()
+	// Create an in-memory file to support io.ReadSeeker needed for NewDecoder which is needed for finalizing headers.
+	inMemoryFilename := "in-memory-reader.wav"
+	inMemoryFile, err := fs.Create(inMemoryFilename)
+	dbg(err)
+	_, err = inMemoryFile.Write(byteData)
+	dbg(err)
+	dbg(inMemoryFile.Close())
+
+	// TODO: Might be easier to just .Seek(0)
+	inMemoryFileReopen, err := fs.Open(inMemoryFilename)
+	dbg(err)
+	return inMemoryFileReopen
+}
+
+// ConvertWavToOneByteMulawSamples assumes encoding 7 (or one byte per value)
+func ConvertWavToOneByteMulawSamples(wavByteData []byte, outputSampleRate uint32) ([]byte, error) {
+	wavReadSeaker := convertBytesToReadSeeker(wavByteData)
+	decoder := wav.NewDecoder(wavReadSeaker)
+	outputIntBuffer, err := decoder.FullPCMBuffer()
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode given wavByteData %w", err)
+	}
+	format := outputIntBuffer.Format
+	log.Debug().Int("sample_rate", format.SampleRate).Int("num_channels", format.NumChannels).Int("source_bit_depth", outputIntBuffer.SourceBitDepth).Int("num_frames", outputIntBuffer.NumFrames()).Msg("ConvertWavToOneByteMulawSamples read input")
+
+	outputBytes := make([]byte, len(outputIntBuffer.Data))
+	for i, intVal := range outputIntBuffer.Data {
+		outputBytes[i] = byte(intVal) // poor man's downsample (only works for 16,000 -> 8,000)
+	}
+	return outputBytes, nil
+
+	// Resample and stuff; TODO: do we need it?
+	//numChannels := uint32(1)
+	//audioFormat := 7
+	//resampledBytes, err := convertIntSamplesToWav(outputIntBuffer, outputSampleRate, numChannels, audioFormat)
+	//if err != nil {
+	//	return nil, fmt.Errorf("cannot resample decoded wavByteData %w", err)
+	//}
+	//
+	//// Yolo
+	//return resampledBytes, nil
+}
+
 // ConvertIntSamplesToWav assumes S16 encoding (or two bytes per value)
+// - There is extra logic to wrap the []byte and []int into a io.WriteSeeker which is required for the wav.NewEncoder.
 func convertIntSamplesToWav(inputBuffer *audio.IntBuffer, sampleRate uint32, numChannels uint32, audioFormat int) (result []byte, err error) {
 	if len(inputBuffer.Data) == 0 {
 		return // Nothing to do
@@ -63,7 +110,7 @@ func convertIntSamplesToWav(inputBuffer *audio.IntBuffer, sampleRate uint32, num
 	// Create a new in-memory file system
 	fs := afero.NewMemMapFs()
 	// Create an in-memory file to support io.WriteSeeker needed for NewEncoder which is needed for finalizing headers.
-	inMemoryFilename := "in-memory-output.wav"
+	inMemoryFilename := "in-memory-writer.wav"
 	inMemoryFile, err := fs.Create(inMemoryFilename)
 	dbg(err)
 	// We will call Close ourselves.
@@ -88,6 +135,7 @@ func convertIntSamplesToWav(inputBuffer *audio.IntBuffer, sampleRate uint32, num
 	}
 
 	// We close and re-open the file so we can properly read-all of its contents.
+	// TODO: Might be easier to just .Seek(0)
 	dbg(inMemoryFile.Close())
 	inMemoryFileReopen, err := fs.Open(inMemoryFilename)
 	dbg(err)

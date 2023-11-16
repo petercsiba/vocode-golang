@@ -8,18 +8,28 @@ import (
 	"github.com/rs/zerolog/log"
 	"os"
 	"runtime/debug"
+	"strconv"
+	"time"
 )
 
 type twilioHandler struct {
+	startMessage       *TwilioStartMessage // To keep the initial config
+	startTime          time.Time
 	allMulawAudioBytes []byte
 	readChan           chan []byte
-	writeChan          chan []byte
+
+	mediaLastSeqNum int
+	writeLastSeqNum int
+	writeChan       chan []byte
 }
 
 func NewTwilioHandler() *twilioHandler {
 	result := &twilioHandler{
+		startMessage:       nil,
 		allMulawAudioBytes: make([]byte, 0),
 		readChan:           make(chan []byte, 100),
+		mediaLastSeqNum:    0,
+		writeLastSeqNum:    0,
 		writeChan:          make(chan []byte, 100),
 	}
 	go result.readMessagesUntilChanClosed()
@@ -45,57 +55,102 @@ type TwilioWebsocketMessage struct {
 }
 
 // TwilioStartMessage contains important metadata about the stream and is sent immediately after the Connected message.
-// It is only sent once at the start of the Stream.
-// Example:
-//
-//	{
-//	 "event": "start",
-//	 "sequenceNumber": "1",
-//	 "start": {
-//	   "accountSid": "ACa9051c185ce5367cfeabc4e1915038f3",
-//	   "streamSid": "MZ863b44f4a82195cf458ba745d43438d6",
-//	   "callSid": "CAc9a9dea7c7b17cdb88ce6f0e0532625c",
-//	   "tracks": [
-//	     "inbound"
-//	   ],
-//	   "mediaFormat": {
-//	     "encoding": "audio/x-mulaw",
-//	     "sampleRate": 8000,
-//	     "channels": 1
-//	   }
-//	 },
-//	 "streamSid": "MZ863b44f4a82195cf458ba745d43438d6"
-//	}
 type TwilioStartMessage struct {
 	TwilioWebsocketMessage
-	Start struct {
-		StreamSid        string            `json:"streamSid"`
-		AccountSid       string            `json:"accountSid"`
-		CallSid          string            `json:"callSid"`
-		Tracks           []string          `json:"tracks"`
-		CustomParameters map[string]string `json:"customParameters"`
-		MediaFormat      struct {
-			Encoding   string `json:"encoding"`
-			SampleRate int    `json:"sampleRate"`
-			Channels   int    `json:"channels"`
-		} `json:"mediaFormat"`
-	} `json:"start"`
+	Start TwilioStart `json:"start"`
+}
+
+type TwilioStart struct {
+	StreamSid        string            `json:"streamSid"`
+	AccountSid       string            `json:"accountSid"`
+	CallSid          string            `json:"callSid"`
+	Tracks           []string          `json:"tracks"`
+	CustomParameters map[string]string `json:"customParameters"`
+	MediaFormat      TwilioMediaFormat `json:"mediaFormat"`
+}
+
+type TwilioMediaFormat struct {
+	Encoding   string `json:"encoding"`
+	SampleRate int    `json:"sampleRate"`
+	Channels   int    `json:"channels"`
+}
+
+// isInList checks if a string is present in a slice of strings.
+func isInList(str string, list []string) bool {
+	for _, v := range list {
+		if v == str {
+			return true
+		}
+	}
+	return false
 }
 
 func (th *twilioHandler) handleStartMessage(msg TwilioStartMessage) {
-	// process the start message
-	// store stream metadata for future use
+	// Some validation first:fddfs
+	if !isInList("inbound", msg.Start.Tracks) {
+		log.Error().Msgf("'inbound' not in Start.Tracks: %v", msg.Start.Tracks)
+	}
+	if !isInList("outbound", msg.Start.Tracks) {
+		log.Error().Msgf("'outbound' not in Start.Tracks: %v", msg.Start.Tracks)
+	}
+	expectedMediaFormat := TwilioMediaFormat{
+		Encoding:   "audio/x-mulaw",
+		SampleRate: 8000,
+		Channels:   1,
+	}
+	if msg.Start.MediaFormat != expectedMediaFormat {
+		log.Error().Msgf("unexpected media format in Start.MediaFormat: %v", msg.Start.MediaFormat)
+	}
+
+	// Real stuff
+	th.startMessage = &msg
+	th.startTime = time.Now()
+
+	// As a test, we just replay the previous recording
+	wavBytes, err := os.ReadFile("output/test-greeting.wav")
+	errLog(err, "os.ReadFile test file")
+	pcmBytes, err := audio_utils.ConvertWavToOneByteMulawSamples(wavBytes, 8000)
+
+	errLog(err, "ConvertWavToOneByteMulawSamples test file")
+	base64String := base64.StdEncoding.EncodeToString(pcmBytes)
+
+	// Twilio: The media payload should not contain audio file type header bytes.
+	// Providing header bytes will cause the media to be streamed incorrectly.
+	// https://www.twilio.com/docs/voice/twiml/stream#message-media-to-twilio
+
+	mediaMessage := TwilioMediaMessage{
+		TwilioWebsocketMessage: TwilioWebsocketMessage{
+			Event:          "media",
+			SequenceNumber: strconv.Itoa(th.writeLastSeqNum + 1), // TODO: Have a more robust way
+		},
+		StreamSid: th.startMessage.Start.StreamSid,
+		Media: TwilioMedia{
+			Track:     "outbound",
+			Chunk:     strconv.Itoa(th.mediaLastSeqNum + 1),
+			Timestamp: strconv.Itoa(int(time.Since(th.startTime).Milliseconds())),
+			Payload:   base64String,
+		},
+	}
+
+	th.writeMessage(mediaMessage)
 }
 
+// TwilioMediaMessage https://www.twilio.com/docs/voice/twiml/stream#message-media
 type TwilioMediaMessage struct {
 	TwilioWebsocketMessage
-	Media struct {
-		Track     string `json:"track"`
-		Chunk     string `json:"chunk"`
-		Timestamp string `json:"timestamp"`
-		// This is base64 encoded audio/x-mulaw - which is a form of audio compression commonly used in telephony.
-		Payload string `json:"payload"`
-	} `json:"media"`
+	StreamSid string      `json:"streamSid"`
+	Media     TwilioMedia `json:"media"`
+}
+
+type TwilioMedia struct {
+	// One of inbound or outbound
+	Track string `json:"track"`
+	// The chunk for the message. The first message will begin with "1" and increment with each subsequent message.
+	Chunk string `json:"chunk"`
+	// Presentation Timestamp in Milliseconds from the start of the stream.
+	Timestamp string `json:"timestamp"`
+	// This is base64 encoded audio/x-mulaw - which is a form of audio compression commonly used in telephony.
+	Payload string `json:"payload"`
 }
 
 func (th *twilioHandler) handleMediaMessage(mediaMessage TwilioMediaMessage) {
@@ -129,6 +184,14 @@ type TwilioMarkMessage struct {
 
 func (th *twilioHandler) handleMarkMessage(msg TwilioMarkMessage) {
 	// process the mark message
+}
+
+func (th *twilioHandler) writeMessage(msg interface{}) {
+	msgBytes, err := json.Marshal(msg)
+	errLog(err, "jsonMarshal TwilioWebsocketMessage") // shouldn't happen
+
+	log.Debug().Msgf("sending message: %s", string(msgBytes))
+	th.writeChan <- msgBytes
 }
 
 func (th *twilioHandler) readMessagesUntilChanClosed() {

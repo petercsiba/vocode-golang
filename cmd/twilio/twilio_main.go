@@ -60,6 +60,7 @@ func NewWebsocketHandlerFunc(createHandler func() WebsocketMessageHandler) func(
 		defer func() { errLog(ws.Close(), "websocket.Close()") }()
 
 		// Start a goroutine for sending messages
+		// TODO(P1, ux): Interrupts / sigkills should also clean up all alive websocket connections.
 		go func() {
 			for {
 				msg, ok := <-handler.GetWriter()
