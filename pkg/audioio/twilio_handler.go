@@ -4,18 +4,34 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"github.com/petrzlen/vocode-golang/pkg/audio_utils"
 	"github.com/rs/zerolog/log"
-	"net/http"
 	"os"
 	"runtime/debug"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Adjust the origin check as needed
-	},
+type twilioHandler struct {
+	allMulawAudioBytes []byte
+	readChan           chan []byte
+	writeChan          chan []byte
+}
+
+func NewTwilioHandler() *twilioHandler {
+	result := &twilioHandler{
+		allMulawAudioBytes: make([]byte, 0),
+		readChan:           make(chan []byte, 100),
+		writeChan:          make(chan []byte, 100),
+	}
+	go result.readMessagesUntilChanClosed()
+	return result
+}
+
+func (th *twilioHandler) GetReader() chan<- []byte {
+	return th.readChan
+}
+
+func (th *twilioHandler) GetWriter() <-chan []byte {
+	return th.writeChan
 }
 
 // TwilioWebsocketMessage is a base struct for all Websocket events with Twilio.
@@ -66,7 +82,7 @@ type TwilioStartMessage struct {
 	} `json:"start"`
 }
 
-func handleStartMessage(msg TwilioStartMessage) {
+func (th *twilioHandler) handleStartMessage(msg TwilioStartMessage) {
 	// process the start message
 	// store stream metadata for future use
 }
@@ -82,16 +98,14 @@ type TwilioMediaMessage struct {
 	} `json:"media"`
 }
 
-var allMulawAudioBytes []byte = make([]byte, 0)
-
-func handleMediaMessage(mediaMessage TwilioMediaMessage) {
+func (th *twilioHandler) handleMediaMessage(mediaMessage TwilioMediaMessage) {
 	// https://en.wikipedia.org/wiki/%CE%9C-law_algorithm
 	mulawAudioData, err := base64.StdEncoding.DecodeString(mediaMessage.Media.Payload)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to decode base64 audio data")
 		return
 	}
-	allMulawAudioBytes = append(allMulawAudioBytes, mulawAudioData...)
+	th.allMulawAudioBytes = append(th.allMulawAudioBytes, mulawAudioData...)
 }
 
 type TwilioStopMessage struct {
@@ -102,7 +116,7 @@ type TwilioStopMessage struct {
 	} `json:"stop"`
 }
 
-func handleStopMessage(msg TwilioStopMessage) {
+func (th *twilioHandler) handleStopMessage(msg TwilioStopMessage) {
 	// handle the stop event, maybe clean up resources
 }
 
@@ -113,92 +127,63 @@ type TwilioMarkMessage struct {
 	} `json:"mark"`
 }
 
-func handleMarkMessage(msg TwilioMarkMessage) {
+func (th *twilioHandler) handleMarkMessage(msg TwilioMarkMessage) {
 	// process the mark message
 }
 
-func handleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		// Handle error
-	}
-	defer ws.Close()
-
-	// Here, you'll interact with the Twilio audio streams
-	for {
-		_, msg, err := ws.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
-				log.Info().Msg("WebSocket connection closed normally")
-			} else {
-				log.Error().Err(err).Msgf("couldn't read mefdssage from websocket: %s", string(msg))
-			}
-			// Usually, nothing good will happen ever after a bad websocket message
-			break
-		}
-
-		var message TwilioWebsocketMessage
-		err = json.Unmarshal(msg, &message)
-		if err != nil {
-			// Maybe I just wrongfully implemented, or they changed the API
-			log.Error().Err(err).Msgf("couldn't decode message from websocket: %s", string(msg))
-			continue
-		}
-
-		log.Debug().Msgf("received message: %s", string(msg))
-
-		switch message.Event {
-		case "connected":
-			// handle connected event
-		case "start":
-			var startMessage TwilioStartMessage
-			errLog(json.Unmarshal(msg, &startMessage), "json.Unmarshal startMessage")
-			handleStartMessage(startMessage)
-		case "media":
-			var mediaMessage TwilioMediaMessage
-			errLog(json.Unmarshal(msg, &mediaMessage), "json.Unmarshal mediaMessage")
-			handleMediaMessage(mediaMessage)
-		case "stop":
-			var stopMessage TwilioStopMessage
-			errLog(json.Unmarshal(msg, &stopMessage), "json.Unmarshal stopMessage")
-			handleStopMessage(stopMessage)
-			break
-		case "mark":
-			var markMessage TwilioMarkMessage
-			errLog(json.Unmarshal(msg, &markMessage), "json.Unmarshal markMessage")
-			handleMarkMessage(markMessage)
-		default:
-			log.Error().Err(fmt.Errorf("unknown message.Event %s", message.Event)).Msg("")
-		}
+func (th *twilioHandler) readMessagesUntilChanClosed() {
+	for msg := range th.readChan {
+		th.handleMessage(msg)
 	}
 
 	// https://github.com/go-audio/wav/issues/29
 	// https://stackoverflow.com/questions/59767373/convert-8khz-mulaw-to-16khz-pcm-in-real-time
-	wavAudioBytes, err := audio_utils.ConvertOneByteMulawSamplesToWav(allMulawAudioBytes, 8000, 16000)
+	wavAudioBytes, err := audio_utils.ConvertOneByteMulawSamplesToWav(th.allMulawAudioBytes, 8000, 16000)
 	dbg(err)
 
 	log.Info().Msgf("websocket finished, gonna write %d bytes", len(wavAudioBytes))
 	dbg(os.WriteFile("output/entire-phone-recording.wav", wavAudioBytes, 0644))
 }
 
-//type twilioHandler struct {
-//}
+func (th *twilioHandler) handleMessage(msg []byte) {
+	var message TwilioWebsocketMessage
+	err := json.Unmarshal(msg, &message)
+	if err != nil {
+		// Maybe I just wrongfully implemented, or they changed the API
+		log.Error().Err(err).Msgf("couldn't decode message from websocket: %s", string(msg))
+		return
+	}
 
-func NewTwilioHandler() {
-	http.HandleFunc("/ws", handleConnections)
-	ftl(http.ListenAndServe(":8081", nil))
+	log.Debug().Msgf("received message: %s", string(msg))
+
+	switch message.Event {
+	case "connected":
+		// handle connected event
+	case "start":
+		var startMessage TwilioStartMessage
+		errLog(json.Unmarshal(msg, &startMessage), "json.Unmarshal startMessage")
+		th.handleStartMessage(startMessage)
+	case "media":
+		var mediaMessage TwilioMediaMessage
+		errLog(json.Unmarshal(msg, &mediaMessage), "json.Unmarshal mediaMessage")
+		th.handleMediaMessage(mediaMessage)
+	case "stop":
+		var stopMessage TwilioStopMessage
+		errLog(json.Unmarshal(msg, &stopMessage), "json.Unmarshal stopMessage")
+		th.handleStopMessage(stopMessage)
+		break
+	case "mark":
+		var markMessage TwilioMarkMessage
+		errLog(json.Unmarshal(msg, &markMessage), "json.Unmarshal markMessage")
+		th.handleMarkMessage(markMessage)
+	default:
+		log.Error().Err(fmt.Errorf("unknown message.Event %s", message.Event)).Msg("")
+	}
 }
 
 func errLog(err error, what string) {
 	if err != nil {
 		log.Error().Err(err).Msg(what)
-		debug.PrintStack()
-	}
-}
-
-func ftl(err error) {
-	if err != nil {
-		log.Fatal().Err(err).Msg("sth essential failed")
 		debug.PrintStack()
 	}
 }
