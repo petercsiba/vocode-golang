@@ -16,18 +16,47 @@ func dbg(err error) {
 	}
 }
 
-// ConvertByteSamplesToWav assumes S16 encoding (or two bytes per value)
-func ConvertByteSamplesToWav(byteData []byte, sampleRate uint32, numChannels uint32) (result []byte, err error) {
+// ConvertTwoByteSamplesToWav assumes S16 encoding (or two bytes per value)
+func ConvertTwoByteSamplesToWav(byteData []byte, sampleRate uint32, numChannels uint32) (result []byte, err error) {
 	intData := twoByteDataToIntSlice(byteData)
-	return ConvertIntSamplesToWav(intData, sampleRate, numChannels)
+
+	// For most parameters, we just do the same in both input and output.
+	inputBuffer := &audio.IntBuffer{
+		Data: intData,
+		Format: &audio.Format{
+			SampleRate:  int(sampleRate),
+			NumChannels: int(numChannels),
+		},
+		SourceBitDepth: 16,
+	}
+
+	audioFormat := 1
+	return convertIntSamplesToWav(inputBuffer, sampleRate, numChannels, audioFormat)
+}
+
+// ConvertOneByteMulawSamplesToWav assumes encoding 7 (or one byte per value)
+func ConvertOneByteMulawSamplesToWav(byteData []byte, inputSampleRate, outputSampleRate uint32) (result []byte, err error) {
+	// https://github.com/go-audio/wav/issues/29
+	intData := oneByteDataToIntSlice(byteData)
+	sourceBitDepth := 8
+	numChannels := uint32(1)
+	audioFormat := 7
+
+	inputBuffer := &audio.IntBuffer{
+		Data: intData,
+		Format: &audio.Format{
+			SampleRate:  int(inputSampleRate),
+			NumChannels: int(numChannels),
+		},
+		SourceBitDepth: sourceBitDepth,
+	}
+
+	return convertIntSamplesToWav(inputBuffer, outputSampleRate, numChannels, audioFormat)
 }
 
 // ConvertIntSamplesToWav assumes S16 encoding (or two bytes per value)
-func ConvertIntSamplesToWav(intData []int, sampleRate uint32, numChannels uint32) (result []byte, err error) {
-	iSampleRate := int(sampleRate)
-	iNumChannels := int(numChannels)
-
-	if len(intData) == 0 {
+func convertIntSamplesToWav(inputBuffer *audio.IntBuffer, sampleRate uint32, numChannels uint32, audioFormat int) (result []byte, err error) {
+	if len(inputBuffer.Data) == 0 {
 		return // Nothing to do
 	}
 
@@ -39,14 +68,13 @@ func ConvertIntSamplesToWav(intData []int, sampleRate uint32, numChannels uint32
 	dbg(err)
 	// We will call Close ourselves.
 
-	// Convert audio_utils data to IntBuffer
-	inputBuffer := &audio.IntBuffer{Data: intData, Format: &audio.Format{SampleRate: iSampleRate, NumChannels: iNumChannels}}
-
+	outputBitDepth := 16
+	iSampleRate := int(sampleRate)
+	iNumChannels := int(numChannels)
+	// TODO: Should we somewhat adjust outputSampleRate? Here we re-use the input one.
 	// Create a new WAV wavEncoder
-	bitDepth := 16
-	audioFormat := 1
-	wavEncoder := wav.NewEncoder(inMemoryFile, iSampleRate, bitDepth, iNumChannels, audioFormat)
-	log.Debug().Int("int_data_length", len(intData)).Int("sample_rate", iSampleRate).Int("bit_depth", bitDepth).Int("num_channels", iNumChannels).Int("audio_format", audioFormat).Msg("encoding int stream output as a wav")
+	wavEncoder := wav.NewEncoder(inMemoryFile, iSampleRate, outputBitDepth, iNumChannels, audioFormat)
+	log.Debug().Int("int_data_length", len(inputBuffer.Data)).Int("sample_rate", iSampleRate).Int("source_bit_depth", inputBuffer.SourceBitDepth).Int("output_bit_depth", outputBitDepth).Int("num_channels", iNumChannels).Int("audio_format", audioFormat).Msg("encoding int stream output as a wav")
 	// Write to WAV wavEncoder
 	if err = wavEncoder.Write(inputBuffer); err != nil {
 		err = fmt.Errorf("cannot encode byte output as wav %w", err)
@@ -70,6 +98,14 @@ func ConvertIntSamplesToWav(intData []int, sampleRate uint32, numChannels uint32
 		return
 	}
 	return
+}
+
+func oneByteDataToIntSlice(bytes []byte) []int {
+	intData := make([]int, len(bytes))
+	for i, b := range bytes {
+		intData[i] = int(b)
+	}
+	return intData
 }
 
 func twoByteDataToIntSlice(audioData []byte) []int {

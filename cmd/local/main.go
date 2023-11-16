@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/hajimehoshi/go-mp3"
 	"github.com/joho/godotenv"
+	"github.com/petrzlen/vocode-golang/internal/utils"
 	"github.com/petrzlen/vocode-golang/pkg/agent"
 	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/petrzlen/vocode-golang/pkg/models"
@@ -20,7 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -269,13 +269,7 @@ func playTTSUntilInterruptRoutine(ttsOutputBuffer chan models.AudioData, audioTo
 // Using https://github.com/sashabaranov/go-openai/blob/d6f3bdcdac9172ab5248d6be8c3e1761446a434c/chat_stream.go#L62
 func main() {
 	setupStart := time.Now()
-	// Set up zerolog with custom output to include milliseconds in the timestamp
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: "2006-01-02T15:04:05.000-07:00", // Fake news, BUT we need milliseconds to debug stuff.
-	}).With().Timestamp().Logger()
-	// https://github.com/rs/zerolog/issues/114
-	zerolog.TimeFieldFormat = time.RFC3339Nano
+	utils.SetupZerolog()
 
 	// Load the .env file
 	err := godotenv.Load()

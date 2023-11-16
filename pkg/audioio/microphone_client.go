@@ -133,7 +133,7 @@ func (m *microphone) StopRecording() (entireRecording []byte, err error) {
 
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
-	entireRecording, err = audio_utils.ConvertByteSamplesToWav(m.pSampleData, m.getSampleRate(), m.getNumChannels())
+	entireRecording, err = audio_utils.ConvertTwoByteSamplesToWav(m.pSampleData, m.getSampleRate(), m.getNumChannels())
 
 	log.Info().Msg("closing recordingChan from StopRecording")
 	close(m.recordingChan)
@@ -225,7 +225,7 @@ func (m *microphone) maybeFlushBuffer(isEnd bool) int {
 	log.Trace().Int("start_byte_index", startIndex).Int("end_byte_index", endIndex).Msg("flushing pSample data into wav output")
 
 	byteData := m.pSampleData[m.pSampleDataBufferIdx:endIndex]
-	wavData, err := audio_utils.ConvertByteSamplesToWav(byteData, sampleRate, numChannels)
+	wavData, err := audio_utils.ConvertTwoByteSamplesToWav(byteData, sampleRate, numChannels)
 	if err != nil {
 		log.Error().Err(err).Int("byte_data_length", len(byteData)).Msg("could not convert byteData to wavData")
 		return endIndex
