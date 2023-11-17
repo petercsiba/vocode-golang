@@ -1,21 +1,27 @@
 package audioio
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/petrzlen/vocode-golang/pkg/audio_utils"
+	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/rs/zerolog/log"
 	"io"
 	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
+const TwilioMulawSampleRate = 8000
+
+// TODO(P0, race): There are definitely race conditions here, think about it. Especially around
+// graceful shutdown and channel closes.
 type twilioHandler struct {
+	// Twilio Protocol
 	startMessage       *TwilioMessage // To keep the initial config
 	startTime          time.Time
 	allMulawAudioBytes []byte
@@ -24,16 +30,33 @@ type twilioHandler struct {
 	mediaLastSeqNum int
 	writeLastSeqNum int
 	writeChan       chan []byte
+	isStopped       bool
+
+	// Package interface
+	recordingChan chan models.AudioData
+	// speechStartsIdx <= silenceStartsIdx || silenceStartsIdx == -1
+	speechStartsIdx  int
+	silenceStartsIdx int
+	currentWindowIdx int
 }
 
 func NewTwilioHandler() *twilioHandler {
 	result := &twilioHandler{
+		// Twilio Protocol
 		startMessage:       nil,
 		allMulawAudioBytes: make([]byte, 0),
 		readChan:           make(chan []byte, 100),
 		mediaLastSeqNum:    0,
 		writeLastSeqNum:    0,
 		writeChan:          make(chan []byte, 100),
+		isStopped:          false,
+
+		// Package interface
+		recordingChan: nil,
+
+		speechStartsIdx:  -1,
+		silenceStartsIdx: -1,
+		currentWindowIdx: 0,
 	}
 	go result.readMessagesUntilChanClosed()
 	return result
@@ -49,6 +72,34 @@ func (th *twilioHandler) GetWriter() <-chan []byte {
 	return th.writeChan
 }
 
+// StartRecording implements InputDevice.StartRecording
+// -- NOTE: The recording actually starts when the Websocket is established.
+// When the readChan is closed (i.e. connection is dropped), then it will also call StopRecording()
+func (th *twilioHandler) StartRecording(recordingChan chan models.AudioData) error {
+	th.recordingChan = recordingChan
+	return nil
+}
+
+// StopRecording implements InputDevice.StopRecording
+func (th *twilioHandler) StopRecording() ([]byte, error) {
+	err := th.Stop()
+
+	return nil, err
+}
+
+// Stop implements OutputDevice.Stop
+func (th *twilioHandler) Stop() error {
+	th.isStopped = true
+	log.Info().Str("stream_id", th.getStreamId()).Msg("writeChan close")
+
+	// This will trigger the websocket close,
+	// which will then trigger the readChan to close,
+	// which then triggers the recordingChan to close.
+	close(th.writeChan)
+
+	return nil
+}
+
 // Play implements OutputDevice.Play
 func (th *twilioHandler) Play(audioOutput io.Reader) (*sync.WaitGroup, error) {
 	// TODO: Technically we can implement the sync.WaitGroup with Mark messages
@@ -57,7 +108,7 @@ func (th *twilioHandler) Play(audioOutput io.Reader) (*sync.WaitGroup, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read audioInput %w", err)
 	}
-	pcmBytes, err := audio_utils.ConvertWavToOneByteMulawSamples(wavBytes, 8000)
+	pcmBytes, err := audio_utils.ConvertWavToOneByteMulawSamples(wavBytes, TwilioMulawSampleRate)
 	if err != nil {
 		return nil, fmt.Errorf("cannot convert audioOutput to mulaw samples %w", err)
 	}
@@ -68,11 +119,12 @@ func (th *twilioHandler) Play(audioOutput io.Reader) (*sync.WaitGroup, error) {
 	// Providing header bytes will cause the media to be streamed incorrectly.
 	// https://www.twilio.com/docs/voice/twiml/stream#message-media-to-twilio
 
+	th.mediaLastSeqNum++
 	mediaMessage := TwilioMessage{
 		Event: "media",
 		Media: &TwilioMediaPayload{
 			Track:     "outbound",
-			Chunk:     strconv.Itoa(th.mediaLastSeqNum + 1),
+			Chunk:     strconv.Itoa(th.mediaLastSeqNum),
 			Timestamp: strconv.Itoa(int(time.Since(th.startTime).Milliseconds())),
 			Payload:   base64String,
 		},
@@ -100,11 +152,11 @@ func (th *twilioHandler) getStreamId() string {
 }
 
 func (th *twilioHandler) handleStartMessage(msg TwilioMessage) {
+	// == First, some validations
 	if msg.Start == nil {
 		log.Error().Msgf("msg.Start is nil for msg.event = 'start': %v", msg)
 		return
 	}
-	// Some validation first:fddfs
 	if !isInList("inbound", msg.Start.Tracks) {
 		log.Error().Msgf("'inbound' NOT in Start.Tracks: %v", msg.Start.Tracks)
 	}
@@ -116,57 +168,143 @@ func (th *twilioHandler) handleStartMessage(msg TwilioMessage) {
 	}
 	expectedMediaFormat := TwilioMediaFormat{
 		Encoding:   "audio/x-mulaw",
-		SampleRate: 8000,
+		SampleRate: TwilioMulawSampleRate,
 		Channels:   1,
 	}
 	if msg.Start.MediaFormat != expectedMediaFormat {
 		log.Error().Msgf("unexpected media format in Start.MediaFormat: %v", msg.Start.MediaFormat)
 	}
 
-	// Real stuff
+	// == Then the real stuff
 	th.startMessage = &msg
 	th.startTime = time.Now()
-
-	// As a test, we just replay the previous recording
-	wavBytes, err := os.ReadFile("output/test-greeting.wav")
-	errLog(err, "os.ReadFile test file")
-	th.Play(bytes.NewReader(wavBytes))
 }
 
 func (th *twilioHandler) handleMediaMessage(msg TwilioMessage) {
 	if msg.Media == nil {
-		log.Error().Msgf("msg.Media is nil for msg.event = 'media': %v", msg)
+		log.Error().Str("stream_id", th.getStreamId()).Msgf("msg.Media is nil for msg.event = 'media': %v", msg)
 		return
 	}
-	if msg.Media.Track == "outbound" {
-		log.Debug().Msg("received track='outbound' media type, ignoring")
+	if msg.Media.Track != "inbound" {
+		log.Debug().Str("stream_id", th.getStreamId()).Msgf("received track='%s' media type, ignoring", msg.Media.Track)
 		return
 	}
 
 	// https://en.wikipedia.org/wiki/%CE%9C-law_algorithm
 	mulawAudioData, err := base64.StdEncoding.DecodeString(msg.Media.Payload)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to decode base64 audio data")
+		log.Error().Str("stream_id", th.getStreamId()).Err(err).Msg("Failed to decode base64 audio data")
 		return
 	}
 	th.allMulawAudioBytes = append(th.allMulawAudioBytes, mulawAudioData...)
+
+	th.maybeSubmitAudioOutput()
+}
+
+// TODO(P1, devx): Feels like the "VAD" or "silence detection" should be abstracted away
+// as this custom logic is getting overly complex.
+// BUT then every input method has different sensitivity / properties / expectations from UX.
+func (th *twilioHandler) maybeSubmitAudioOutput() {
+	speechThresholdCount := 2 * TwilioMulawSampleRate
+	silenceThresholdCount := 5 * TwilioMulawSampleRate
+	if len(th.allMulawAudioBytes) < speechThresholdCount {
+		return
+	}
+
+	for ; th.currentWindowIdx < len(th.allMulawAudioBytes); th.currentWindowIdx++ {
+		if th.currentWindowIdx%10000 == 0 {
+			log.Trace().Int("all_size", len(th.allMulawAudioBytes)).Int("speechStartsIdx", th.speechStartsIdx).Int("silenceStartsIdx", th.silenceStartsIdx).Int("currentWindowIdx", th.currentWindowIdx).Msg("maybeSubmitAudioOutput")
+		}
+
+		b := th.allMulawAudioBytes[th.currentWindowIdx]
+
+		// TODO(ux, P1): Use some kind of a VAD
+		// Detect start of non-silence, interpreted as speech.
+		if b != 0xff && th.speechStartsIdx < 0 {
+			th.speechStartsIdx = th.currentWindowIdx
+		}
+		if th.speechStartsIdx < 0 {
+			continue
+		}
+		// From now on true that: th.speechStartsIdx >= 0
+		submitAudio := false
+		submitPrompt := false
+
+		// Evaluate if there was enough silence after a speech has started
+		if b == 0xff {
+			if th.silenceStartsIdx == -1 {
+				th.silenceStartsIdx = th.currentWindowIdx
+			}
+			if th.currentWindowIdx-th.silenceStartsIdx >= silenceThresholdCount {
+				submitAudio = true
+				submitPrompt = true
+			}
+		} else {
+			th.silenceStartsIdx = -1
+		}
+
+		// Enough speech to submit audio
+		if th.currentWindowIdx-th.speechStartsIdx >= speechThresholdCount {
+			if th.silenceStartsIdx > 0 && th.currentWindowIdx-th.silenceStartsIdx >= 100 {
+				submitAudio = true
+			}
+		}
+
+		if submitAudio {
+			rawMulawSlice := th.allMulawAudioBytes[th.speechStartsIdx:th.silenceStartsIdx]
+			// Too short would result into garbage (or HTTP 4xx)
+			if len(rawMulawSlice) >= TwilioMulawSampleRate/10 {
+				log.Info().Bool("submit_prompt", submitPrompt).Int("all_size", len(th.allMulawAudioBytes)).Int("speechStartsIdx", th.speechStartsIdx).Int("silenceStartsIdx", th.silenceStartsIdx).Int("currentWindowIdx", th.currentWindowIdx).Msg("detected enough speech with enough silence to submit audio")
+
+				rawWavSlice, err := audio_utils.ConvertOneByteMulawSamplesToWav(rawMulawSlice, TwilioMulawSampleRate, 16000)
+				errLog(err, "maybeSubmitAudioOutput.ConvertOneByteMulawSamplesToWav") // shouldn't happen
+
+				dbg(os.WriteFile(fmt.Sprintf("output/%d-%d.wav", th.speechStartsIdx, th.silenceStartsIdx), rawWavSlice, 0644))
+
+				th.recordingChan <- models.AudioData{
+					EventType: models.AudioInput,
+					ByteData:  rawWavSlice,
+					Format:    "wav",
+					Length:    time.Duration(float64(len(rawMulawSlice)) / float64(TwilioMulawSampleRate)),
+					Trace:     models.NewTrace("twilio.stream"),
+				}
+
+				th.speechStartsIdx = th.silenceStartsIdx // Note, this can make the next slice 0
+			}
+		}
+
+		// Note: By having a long silence required in the end, the TranscriberRoutine will
+		// be likely done, and we can submit chat request right away.
+		if submitPrompt {
+			log.Info().Int("all_size", len(th.allMulawAudioBytes)).Int("speechStartsIdx", th.speechStartsIdx).Int("silenceStartsIdx", th.silenceStartsIdx).Int("currentWindowIdx", th.currentWindowIdx).Msg("enough silence to submitPrompt")
+			th.recordingChan <- models.NewAudioDataSubmit("twilio.silence")
+
+			th.speechStartsIdx = -1
+			th.silenceStartsIdx = -1
+		}
+	}
 }
 
 func (th *twilioHandler) handleStopMessage(msg TwilioMessage) {
 	if msg.Stop == nil {
-		log.Error().Msgf("msg.Stop is nil for msg.event = 'stop': %v", msg)
+		log.Error().Str("stream_id", th.getStreamId()).Msgf("msg.Stop is nil for msg.event = 'stop': %v", msg)
 		return
 	}
 }
 
 func (th *twilioHandler) handleMarkMessage(msg TwilioMessage) {
 	if msg.Mark == nil {
-		log.Error().Msgf("msg.Mark is nil for msg.event = 'mark': %v", msg)
+		log.Error().Str("stream_id", th.getStreamId()).Msgf("msg.Mark is nil for msg.event = 'mark': %v", msg)
 		return
 	}
 }
 
 func (th *twilioHandler) sendMessage(msg TwilioMessage) {
+	if th.isStopped {
+		log.Debug().Str("stream_id", th.getStreamId()).Msgf("cannot send message after twilioHandler isStopped: %v", msg)
+		return
+	}
+
 	th.writeLastSeqNum++
 	msg.SequenceNumber = strconv.Itoa(th.writeLastSeqNum)
 	msg.StreamSid = th.getStreamId()
@@ -183,42 +321,54 @@ func (th *twilioHandler) readMessagesUntilChanClosed() {
 		th.handleMessage(msg)
 	}
 
-	// https://github.com/go-audio/wav/issues/29
-	// https://stackoverflow.com/questions/59767373/convert-8khz-mulaw-to-16khz-pcm-in-real-time
-	wavAudioBytes, err := audio_utils.ConvertOneByteMulawSamplesToWav(th.allMulawAudioBytes, 8000, 16000)
-	dbg(err)
+	// After reading done, there is no more to produce.
+	log.Info().Str("stream_id", th.getStreamId()).Msg("th.recordingChan CLOSE")
+	close(th.recordingChan)
 
-	log.Info().Msgf("websocket finished, gonna write %d bytes", len(wavAudioBytes))
-	dbg(os.WriteFile("output/entire-phone-recording.wav", wavAudioBytes, 0644))
+	th.debugDumpAllRecording()
 }
 
-func (th *twilioHandler) handleMessage(msg []byte) {
-	var message TwilioMessage
-	err := json.Unmarshal(msg, &message)
+func (th *twilioHandler) handleMessage(msgBytes []byte) {
+	var msg TwilioMessage
+	err := json.Unmarshal(msgBytes, &msg)
 	if err != nil {
 		// Maybe I just wrongfully implemented, or they changed the API
-		log.Error().Err(err).Msgf("couldn't decode message from websocket: %s", string(msg))
+		log.Error().Err(err).Msgf("couldn't decode msg from websocket: %s", string(msgBytes))
 		return
 	}
 
-	log.Debug().Msgf("received message: %s", string(msg))
-
-	switch message.Event {
-	case "connected":
-		th.handleConnectedMessage(message)
-	case "start":
-		th.handleStartMessage(message)
-	case "media":
-		th.handleMediaMessage(message)
-	case "stop":
-		th.handleStopMessage(message)
-	case "mark":
-		th.handleMarkMessage(message)
-	case "clear":
-		th.handleMarkMessage(message)
-	default:
-		log.Error().Err(fmt.Errorf("unknown message.Event %s", message.Event)).Msg("")
+	// To prevent log-spam, we only log non-media messages, or every 100th media message.
+	if msg.Media == nil || strings.HasSuffix(msg.Media.Chunk, "00") {
+		log.Debug().Msgf("received msg: %s", string(msgBytes))
 	}
+
+	switch msg.Event {
+	case "connected":
+		th.handleConnectedMessage(msg)
+	case "start":
+		th.handleStartMessage(msg)
+	case "media":
+		th.handleMediaMessage(msg)
+	case "stop":
+		th.handleStopMessage(msg)
+	case "mark":
+		th.handleMarkMessage(msg)
+	case "clear":
+		th.handleMarkMessage(msg)
+	default:
+		log.Error().Err(fmt.Errorf("unknown msg.Event %s", msg.Event)).Msg("")
+	}
+}
+
+func (th *twilioHandler) debugDumpAllRecording() {
+	// https://github.com/go-audio/wav/issues/29
+	// https://stackoverflow.com/questions/59767373/convert-8khz-mulaw-to-16khz-pcm-in-real-time
+	wavAudioBytes, err := audio_utils.ConvertOneByteMulawSamplesToWav(th.allMulawAudioBytes, TwilioMulawSampleRate, 16000)
+	dbg(err)
+
+	debugOutputFilename := "output/entire-phone-recording.wav"
+	log.Info().Str("stream_id", th.getStreamId()).Msgf("websocket finished, gonna write %d bytes to %s", len(wavAudioBytes), debugOutputFilename)
+	dbg(os.WriteFile(debugOutputFilename, wavAudioBytes, 0644))
 }
 
 func errLog(err error, what string) {
