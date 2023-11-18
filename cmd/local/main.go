@@ -2,9 +2,7 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
-	"github.com/hajimehoshi/go-mp3"
 	"github.com/joho/godotenv"
 	"github.com/petrzlen/vocode-golang/internal/utils"
 	"github.com/petrzlen/vocode-golang/pkg/agent"
@@ -13,7 +11,6 @@ import (
 	"github.com/petrzlen/vocode-golang/pkg/synthesizer"
 	"github.com/petrzlen/vocode-golang/pkg/transcriber"
 	"github.com/sashabaranov/go-openai"
-	"io"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -23,10 +20,6 @@ import (
 
 	"github.com/rs/zerolog/log"
 )
-
-// MinTextBufferForTtsCharLength is mostly to prevent saying like "1,"
-// in other cases it's best to just start as soon as first chat completions arrive.
-const MinTextBufferForTtsCharLength = 3
 
 // OpenAiSampleRate - this I have measured by decodedMp3.SampleRate
 const OpenAiSampleRate = 24000
@@ -44,96 +37,6 @@ func setupSignalHandler(cleanup func()) {
 		// Exit if necessary
 		os.Exit(1)
 	}()
-}
-
-func isPunctuationMarkAtEnd(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	lastChar := s[len(s)-1]
-	switch lastChar {
-	case ',', '.', '?', '!', ';', ':':
-		return true
-	default:
-		return false
-	}
-}
-
-func textToSpeechAndEncodeRoutine(tts synthesizer.Synthesizer, textChan <-chan string, audioOutputChan chan<- models.AudioData) {
-	log.Info().Msgf("textToSpeechAndEncodeRoutine started")
-	var buffer string
-
-	firstEligibleBuffer := true
-	for {
-		select {
-		case text, ok := <-textChan:
-			if ok {
-				buffer += text
-			}
-			// log.Trace().Str("text", text).Bool("ok", ok).Str("buffer", buffer).Msg("text received")
-			if (len(buffer) > MinTextBufferForTtsCharLength && isPunctuationMarkAtEnd(buffer)) || (!ok && buffer != "") {
-				if firstEligibleBuffer {
-					log.Warn().Msg("TRACING HACK: first eligible buffer triggered")
-					firstEligibleBuffer = false
-				}
-				// Process the buffer;
-				// Speed 1.15 was reverse engineered from the ChatGPT app
-				audioOutput, err := tts.CreateSpeech(buffer, 1.15)
-				if err == nil {
-					audioOutputChan <- audioOutput
-				} else {
-					log.Error().Msgf("cannot buffer tts text for %s cause %v", buffer, err)
-				}
-				buffer = "" // Clear the buffer after processing
-			}
-			if !ok {
-				log.Info().Msgf("textToSpeechAndEncodeRoutine ended")
-				return
-			}
-		}
-	}
-}
-func playAudioChunksRoutine(audioOutput audioio.OutputDevice, rawAudioBytesChan chan []byte) {
-	log.Info().Msgf("playAudioChunksRoutine started")
-
-	i := 0
-	for rawAudioBytes := range rawAudioBytesChan {
-		i += 1
-		if i <= 2 { // Doing 2, cause first is filler word.
-			log.Warn().Int("num", i).Msg("TRACING HACK: tts received")
-		}
-
-		// log.Debug().Msgf("attempting to play %d bytes of mp3", len(rawAudioBytes))
-		startTime := time.Now()
-
-		// TODO(prod, P0): Only do this locally to debug stuff
-		debugFilename := fmt.Sprintf("output/%d.mp3", i)
-		err := os.WriteFile(debugFilename, rawAudioBytes, 0644)
-		if err != nil {
-			log.Debug().Msgf("cannot write debug file %s", debugFilename)
-		}
-
-		// TODO: Can we just Play the rawAudioBytes in here?
-		decodedMp3, decodedMp3Err := mp3.NewDecoder(bytes.NewReader(rawAudioBytes))
-		if decodedMp3Err != nil && !errors.Is(decodedMp3Err, io.EOF) {
-			log.Error().Err(decodedMp3Err).Msg("mp3.NewDecoder failed, skipping chunk")
-			continue
-		}
-		log.Debug().Int("sample_rate", decodedMp3.SampleRate()).Int64("byte_size", decodedMp3.Length()).Msg("player START")
-
-		waitTilDone, err := audioOutput.Play(decodedMp3) // Sub-millisecond time
-		if i == 1 {
-			log.Warn().Msg("TRACING HACK: first playback started")
-		}
-		if err != nil {
-			log.Error().Err(err).Msgf("cannot play decoded mp3")
-		} else {
-			waitTilDone.Wait()
-		}
-
-		log.Debug().Dur("duration", time.Since(startTime)).Msg("player DONE")
-	}
-	log.Info().Msgf("playAudioChunksRoutine finished")
 }
 
 func compareToFullTranscript(transcriber transcriber.Transcriber, wavBytes []byte, finalTranscriptFromSlices string) {
@@ -195,7 +98,7 @@ func userInterruptRoutine(stopChan chan struct{}) {
 	close(stopChan) // Send interrupt signal
 }
 
-func playTTSUntilInterruptRoutine(ttsOutputBuffer chan models.AudioData, audioToPlayChan chan []byte) string {
+func playTTSUntilInterruptRoutine(ttsOutputBuffer chan models.AudioData, audioToPlayChan chan models.AudioData) string {
 	log.Info().Msg("playTTSUntilInterruptRoutine START")
 	interruptChan := make(chan struct{})
 	go userInterruptRoutine(interruptChan)
@@ -211,7 +114,7 @@ func playTTSUntilInterruptRoutine(ttsOutputBuffer chan models.AudioData, audioTo
 			}
 			select {
 			// Plays the audio
-			case audioToPlayChan <- ttsOutput.ByteData:
+			case audioToPlayChan <- ttsOutput:
 				outputText.WriteString(ttsOutput.Text)
 			case <-interruptChan:
 				log.Info().Msg("Interrupt received. playTTSUntilInterruptRoutine STOP")
@@ -247,7 +150,10 @@ func main() {
 	chatAgent := agent.NewOpenAIChatAgent(client)
 	tts := synthesizer.NewOpenAITTS(openAIAPIKey)
 
-	audioOutput, err := audioio.NewSpeakers(OpenAiSampleRate, 2)
+	// We use numChannels = 1, to be consistent across vocode-golang,
+	// although we could have nice stereo output, all of telephony, synthesizer, transcriber really cares only about 1.
+	numChannels := 1
+	audioOutput, err := audioio.NewSpeakers(OpenAiSampleRate, numChannels)
 	ftl(err)
 
 	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
@@ -258,12 +164,12 @@ func main() {
 		runLoop = false
 	})
 
-	audioToPlayChan := make(chan []byte) // non-buffer
+	audioToPlayChan := make(chan models.AudioData) // non-buffer
 	inputAudioChunksChan := make(chan models.AudioData, 100000)
 	inputTextChunksChan := make(chan models.AudioData, 100000)
 	earlyTranscriptChan := make(chan string, 10)
-	go playAudioChunksRoutine(audioOutput, audioToPlayChan)
 	go transcriber.TranscribeAudioRoutine(whisper, inputAudioChunksChan, inputTextChunksChan, earlyTranscriptChan)
+	go audioio.PlayAudioChunksRoutine(audioOutput, audioToPlayChan)
 
 	fullConvo := &models.Conversation{}
 
@@ -305,11 +211,11 @@ func main() {
 
 		// Documentation for the chat and rawAudio routines intent / design:
 		// https://chat.openai.com/share/9ae89c13-9f66-4500-b719-dcd07dd6454d
-		go textToSpeechAndEncodeRoutine(tts, chatOutputChan, ttsOutputBuffer)
+		go synthesizer.TextToSpeechAndEncodeRoutine(tts, chatOutputChan, ttsOutputBuffer)
 
 		// TODO(P2, mem-leaks): Better propagate errors so channels can be properly closed.
 		go func() {
-			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, fullConvo, chatOutputChan))
+			dbg(chatAgent.RunPrompt(agent.SlowerAndSmarter, *fullConvo, chatOutputChan))
 		}()
 		// TODO: Use the assistant, allPrompts is too hacky lol
 

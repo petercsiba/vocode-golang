@@ -1,3 +1,4 @@
+// Package audioio declares audio input/output interface and defines a few common implementations
 // TLDR; Go itself cannot work with Microphone's well
 // BUT it can bind with C-libraries which can do this with a bit of black-magic.
 package audioio
@@ -5,6 +6,7 @@ package audioio
 import (
 	"fmt"
 	"github.com/gen2brain/malgo"
+	"github.com/go-audio/audio"
 	"github.com/petrzlen/vocode-golang/pkg/audio_utils"
 	"github.com/rs/zerolog/log"
 	"os"
@@ -70,12 +72,12 @@ func (m *microphone) getFormat() malgo.FormatType {
 	return m.deviceConfig.Capture.Format
 }
 
-func (m *microphone) getSampleRate() uint32 {
-	return m.deviceConfig.SampleRate
+func (m *microphone) getSampleRate() int {
+	return int(m.deviceConfig.SampleRate)
 }
 
-func (m *microphone) getNumChannels() uint32 {
-	return m.deviceConfig.Capture.Channels
+func (m *microphone) getNumChannels() int {
+	return int(m.deviceConfig.Capture.Channels)
 }
 
 // StartRecording can only be called once for NewMicrophone (maybe?)
@@ -134,7 +136,7 @@ func (m *microphone) StopRecording() (entireRecording []byte, err error) {
 
 	// WRITE IT INTO A WAV STUFF
 	// Might NOT work with non-1 number of channels
-	entireRecording, err = audio_utils.ConvertTwoByteSamplesToWav(m.pSampleData, m.getSampleRate(), m.getNumChannels())
+	entireRecording, err = convertTwoByteMicrophoneSamplesToWav(m.pSampleData, m.getSampleRate(), m.getNumChannels())
 
 	m.recordingChan <- models.NewAudioDataSubmit("microphone.user_stopped_recording")
 	// log.Info().Msg("closing recordingChan from StopRecording")
@@ -176,7 +178,7 @@ func findLastIndexBelowAverage(data []byte, windowSize int, threshold float64) i
 	return lastIndex
 }
 
-func sampleCountForMilliseconds(sampleRate uint32, numChannels uint32, milliseconds int) int {
+func sampleCountForMilliseconds(sampleRate int, numChannels int, milliseconds int) int {
 	return int(int64(milliseconds) * int64(sampleRate) * int64(numChannels) / int64(1000))
 }
 
@@ -227,7 +229,7 @@ func (m *microphone) maybeFlushBuffer(isEnd bool) int {
 	log.Trace().Int("start_byte_index", startIndex).Int("end_byte_index", endIndex).Msg("flushing pSample data into wav output")
 
 	byteData := m.pSampleData[m.pSampleDataBufferIdx:endIndex]
-	wavData, err := audio_utils.ConvertTwoByteSamplesToWav(byteData, sampleRate, numChannels)
+	wavData, err := convertTwoByteMicrophoneSamplesToWav(byteData, sampleRate, numChannels)
 	if err != nil {
 		log.Error().Err(err).Int("byte_data_length", len(byteData)).Msg("could not convert byteData to wavData")
 		return endIndex
@@ -244,4 +246,23 @@ func (m *microphone) maybeFlushBuffer(isEnd bool) int {
 	dbg(os.WriteFile(fmt.Sprintf("output/%d-%d.wav", startIndex, endIndex), wavData, 0644))
 
 	return endIndex
+}
+
+// convertTwoByteMicrophoneSamplesToWav assumes S16 encoding (or two bytes per value)
+func convertTwoByteMicrophoneSamplesToWav(byteData []byte, sampleRate int, numChannels int) (result []byte, err error) {
+	intData := audio_utils.TwoByteDataToIntSlice(byteData)
+
+	// For most parameters, we just do the same in both input and output.
+	bitDepth := 16
+	inputBuffer := &audio.IntBuffer{
+		Data: intData,
+		Format: &audio.Format{
+			SampleRate:  sampleRate,
+			NumChannels: numChannels,
+		},
+		SourceBitDepth: bitDepth,
+	}
+
+	audioFormat := 1
+	return audio_utils.EncodeToWav(inputBuffer, bitDepth, audioFormat)
 }

@@ -2,3 +2,4 @@
 .env
 .idea/inspectionProfiles
 output/*
+testdata

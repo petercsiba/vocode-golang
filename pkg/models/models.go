@@ -29,6 +29,10 @@ const (
 	SubmitPrompt
 )
 
+// AudioData
+// TODO: This should grow up into a more realistic Event like Twilio or Vocode has
+// i.e. distinguish inbound/outbound pipelines; hierarchy of Conversation -> Message -> Event
+// and more event types like Silence / Interrupt / Stop / Finished.
 type AudioData struct {
 	EventType AudioDataEvent
 	ByteData  []byte
@@ -65,8 +69,8 @@ type Conversation struct {
 	Messages  []Message
 }
 
-func NewConversationSimple(text string) *Conversation {
-	return &Conversation{
+func NewConversationSimple(text string) Conversation {
+	return Conversation{
 		StartedAt: time.Now(),
 		Messages: []Message{
 			{Role: "user", Content: text, FinishedAt: time.Now()},

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/petrzlen/vocode-golang/pkg/models"
 	"github.com/rs/zerolog/log"
 	"github.com/sashabaranov/go-openai"
@@ -29,9 +30,11 @@ func conversationToOpenAiMessages(conversation *models.Conversation) []openai.Ch
 }
 
 // RunPrompt
-func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, conversation *models.Conversation, outputChan chan string) error {
+// We pass conversation by value, so it takes a snapshot to avoid potential race conditions.
+func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, conversation models.Conversation, outputChan chan string) error {
 	model := "gpt-3.5-turbo"
 	if modelQuality == SlowerAndSmarter {
+		// TODO(P0, ux): Try "gpt-4-1106-preview" (not suited for production traffic)
 		model = "gpt-4"
 	}
 
@@ -41,7 +44,7 @@ func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, conversation *mod
 	// Create a chat completion request
 	chatRequest := openai.ChatCompletionRequest{
 		Model:       model,
-		Messages:    conversationToOpenAiMessages(conversation),
+		Messages:    conversationToOpenAiMessages(&conversation),
 		Temperature: 0,
 	}
 	log.Info().Str("prompt", conversation.GetLastPrompt()).Str("model", chatRequest.Model).Float32("temperature", chatRequest.Temperature).Msg("executeChatRequest")
@@ -49,8 +52,13 @@ func (o *openaiChatAgent) RunPrompt(modelQuality ModelQuality, conversation *mod
 	// Create a chat completion stream
 	ctx := context.Background()
 	completionStream, createStreamErr := o.client.CreateChatCompletionStream(ctx, chatRequest)
+	// TODO(P2, reliability): P2 cause only happens for very high traffic.
+	// Failed to create chat completion stream: error, status code: 429, message: Rate limit reached for gpt-4 in organization org-Id2OjohDGaS9DT9gEFo41WoU on tokens per min (TPM): Limit 40000, Used 39415, Requested 646. Please try again in 91ms.
+	//Visit https://platform.openai.com/account/rate-limits to learn more.
 	if createStreamErr != nil {
-		log.Panic().Msgf("Failed to create chat completion stream: %v", createStreamErr)
+		err := fmt.Errorf("failed to create chat completion stream: %w", createStreamErr)
+		log.Error().Err(err).Msg("returning for now, we should better handle different kinds of errors")
+		return err
 	}
 
 	var contentBuilder strings.Builder

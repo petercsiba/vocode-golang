@@ -1,10 +1,13 @@
 package audioio
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/ebitengine/oto/v3"
+	"github.com/go-audio/audio"
+	"github.com/petrzlen/vocode-golang/pkg/audio_utils"
 	"github.com/rs/zerolog/log"
-	"io"
+	"os"
 	"sync"
 	"time"
 )
@@ -30,6 +33,9 @@ type speakers struct {
 
 	mutex    sync.Mutex // Protects currentPlayer and stopFlag
 	stopFlag bool       // Indicates if playback should be stopped early
+
+	// For debug
+	fileCount int
 }
 
 func NewSpeakers(sampleRate int, numChannels int) (OutputDevice, error) {
@@ -52,13 +58,24 @@ func NewSpeakers(sampleRate int, numChannels int) (OutputDevice, error) {
 		otoContext:    otoCtx,
 		currentPlayer: nil,
 		stopFlag:      false,
+		fileCount:     0,
 	}, nil
 }
 
 // Play plays the entire stream and returns a WaitGroup if a routine wants to block until done.
-func (s *speakers) Play(audioOutput io.Reader) (*sync.WaitGroup, error) {
+func (s *speakers) Play(intBuffer *audio.IntBuffer) (*sync.WaitGroup, error) {
+	audioOutputBytes, err := audio_utils.EncodeToWavSimple(intBuffer)
+	if err != nil {
+		return nil, fmt.Errorf("cannot encode speakers.Play intBuffer into wav %w", err)
+	}
+
+	// It's ok to take a mutex here only the end, as the playback is started asynchronously on the device.
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	s.fileCount += 1
+	debugPlayedFilename := fmt.Sprintf("output/speaker-played-%d.wav", s.fileCount)
+	dbg(os.WriteFile(debugPlayedFilename, audioOutputBytes, 0644))
 
 	if s.currentPlayer != nil {
 		return nil, fmt.Errorf("currentPlayer isn't nil, you need to call Stop first")
@@ -68,7 +85,11 @@ func (s *speakers) Play(audioOutput io.Reader) (*sync.WaitGroup, error) {
 	s.currentDone = &sync.WaitGroup{}
 	s.currentDone.Add(1)
 
-	s.currentPlayer = s.otoContext.NewPlayer(audioOutput)
+	// TODO(P1, ux): For some unknown reason, this makes a super-short bip/sound at the beginning;
+	// started when I did some changes in mp3Decode.
+	// BUT then for local testing it is actually nice to know how TTS for sliced up hah.
+	// NOTE: this does NOT happen when playing the "output/player-played-%d.wav"
+	s.currentPlayer = s.otoContext.NewPlayer(bytes.NewReader(audioOutputBytes))
 	s.currentPlayer.Play()
 
 	// Monitors and properly stops / closes the player when so decided.
@@ -78,7 +99,7 @@ func (s *speakers) Play(audioOutput io.Reader) (*sync.WaitGroup, error) {
 	return s.currentDone, nil
 }
 
-// Stop, TODO: needs more battle-testing
+// Stop TODO(P2, devx): needs more battle-testing
 func (s *speakers) Stop() error {
 	s.mutex.Lock()
 

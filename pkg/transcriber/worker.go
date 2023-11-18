@@ -17,6 +17,7 @@ func TranscribeAudioRoutine(transcriber Transcriber, audioChunksChan chan models
 
 	// Replace 'client' and 'transcribeAudio' with your actual client and function
 	var transcriptBuilder strings.Builder
+	transcriptRepetitions := 0
 
 	for audioChunk := range audioChunksChan {
 		if earlyTranscriptStartTime == nil {
@@ -36,15 +37,34 @@ func TranscribeAudioRoutine(transcriber Transcriber, audioChunksChan chan models
 		}
 
 		recordingBytes := audioChunk.ByteData
-		// TODO: This should reset
 		previousWords := transcriptBuilder.String()
 		transcript, err := transcriber.SendAudio(bytes.NewReader(recordingBytes), "wav", previousWords)
 		if err != nil {
 			log.Error().Err(err).Int("wav_chunk_byte_length", len(recordingBytes)).Msg("cannot transcribe audio, skipping chunk")
 			continue
 		}
-		transcriptBuilder.WriteString(transcript)
+		// TODO(P0, ux): Here, we need to detect if a question was finished, interrupt voiced or passed turn to agent
+		// E.g. silence in whisper can be repeating last prompt words over and over like:
+		// * .. in 100 words. All right. All right. Well, please, let's do it. All right. Go. All right. All right.
+		// TODO: Add audio length here as a threshold
+		if len(transcript) >= 3 && strings.HasSuffix(previousWords, transcript) {
+			transcriptRepetitions += 1
+		} else {
+			transcriptRepetitions = 0
+		}
+		if transcriptRepetitions >= 2 {
+			log.Info().Msgf("transcripts repeated itself for %d times, gonna submit prompt. Transcript: %s", transcriptRepetitions, transcript)
+			textChunksChan <- models.NewAudioDataSubmit("transcriber.worker")
+			continue
+		}
+		if transcriptRepetitions > 0 {
+			log.Info().Msgf("transcript repeated previous words, skipping audio for: %s", transcript)
+			continue
+		}
+
 		transcriptBuilder.WriteString(" ")
+		transcriptBuilder.WriteString(transcript)
+
 		audioChunk.Text = transcript
 		audioChunk.Trace.ProcessedAt = time.Now()
 		audioChunk.Trace.Processor = "transcribe_open_ai_whisper"

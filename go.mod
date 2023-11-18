@@ -10,6 +10,8 @@ require (
 	github.com/gorilla/websocket v1.5.1
 	github.com/hajimehoshi/go-mp3 v0.3.4
 	github.com/joho/godotenv v1.5.1
+	github.com/mewkiz/flac v1.0.10
+	github.com/pkg/errors v0.9.1
 	github.com/rs/zerolog v1.31.0
 	github.com/sashabaranov/go-openai v1.17.5
 	github.com/spf13/afero v1.10.0
@@ -18,8 +20,10 @@ require (
 require (
 	github.com/ebitengine/purego v0.5.0 // indirect
 	github.com/go-audio/riff v1.0.0 // indirect
+	github.com/icza/bitio v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
+	github.com/mewkiz/pkg v0.0.0-20230226050401-4010bf0fec14 // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 	golang.org/x/text v0.13.0 // indirect

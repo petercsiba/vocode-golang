@@ -26,6 +26,7 @@ func (m ModelQuality) String() string {
 // ChatAgent
 // TODO: Feels like we need a better interface here, but lets wait until conversation.go evolves.
 // - Probably needs to be stateful.
+// We pass conversation by value, so it makes a copy of the messages slice to avoid potential races.
 type ChatAgent interface {
-	RunPrompt(modelQuality ModelQuality, conversation *models.Conversation, outputChan chan string) error
+	RunPrompt(modelQuality ModelQuality, conversation models.Conversation, outputChan chan string) error
 }

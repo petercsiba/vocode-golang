@@ -52,6 +52,8 @@ func (o *openAIWhisper) SendAudio(input io.Reader, fileExtension string, prompt 
 	//result = contentBuilder.String()
 
 	// TODO: Better "silence" detection
+	// On my semi-professional microphone, silence is so pronounced it actually transcribes stuff
+	// (that's also because they trained whisper on movies WITH captions - so non-speaking is often so interpreted too)
 	result = removeNonEnglishAndMBC(resp.Text)
 	if result != resp.Text {
 		log.Info().Str("original_text", resp.Text).Str("processed_text", result).Msg("transcription post-processing removed some text")

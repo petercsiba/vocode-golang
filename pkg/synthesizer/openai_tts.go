@@ -26,13 +26,19 @@ func NewOpenAITTS(openAIAPIKey string) Synthesizer {
 // TODO(devx, P1): Replace with the openai-go one after implemented
 // https://github.com/sashabaranov/go-openai/pull/528/files?diff=unified&w=0
 func (o *openAITTS) CreateSpeech(text string, speed float64) (audioOutput models.AudioData, err error) {
-	log.Debug().Str("input", text).Float64("speed", speed).Msg("sendTTSRequest start")
+	model := "tts-1"
+	// TODO(P0, ux): Experiment with this a bit for speed and quality
+	responseFormat := "mp3"
+	// responseFormat := "flac"
+	// TODO(P2, ux): Opus should be a better format for streaming BUT I would probably painfully die making it work in Golang.
+
+	log.Debug().Str("input", text).Float64("speed", speed).Str("output_format", responseFormat).Str("model", model).Msg("sendTTSRequest start")
 
 	payload := TTSPayload{
-		Model:          "tts-1",
+		Model:          model,
 		Input:          text,
 		Voice:          "echo",
-		ResponseFormat: "mp3", // TODO(ux, P1): Opus should be a better format for streaming, using mp3 for ease.
+		ResponseFormat: responseFormat,
 		Speed:          speed,
 	}
 	reqStr, _ := json.Marshal(payload)
@@ -41,9 +47,10 @@ func (o *openAITTS) CreateSpeech(text string, speed float64) (audioOutput models
 		err = fmt.Errorf("could not do audio/speech for %s cause %w", reqStr, err)
 		return
 	}
+
 	audioOutput = models.AudioData{
 		ByteData: rawAudioBytes,
-		Format:   "wav",
+		Format:   responseFormat,
 		Length:   0, // TODO
 		Text:     text,
 		Trace:    models.NewTrace("openAITTS.CreateSpeech"),

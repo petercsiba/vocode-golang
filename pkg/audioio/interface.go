@@ -1,8 +1,8 @@
 package audioio
 
 import (
+	"github.com/go-audio/audio"
 	"github.com/petrzlen/vocode-golang/pkg/models"
-	"io"
 	"sync"
 )
 
@@ -15,6 +15,6 @@ type InputDevice interface {
 }
 
 type OutputDevice interface {
-	Play(audioOutput io.Reader) (*sync.WaitGroup, error)
+	Play(intBuffer *audio.IntBuffer) (*sync.WaitGroup, error)
 	Stop() error
 }

@@ -1,5 +1,10 @@
 package audioio
 
+import (
+	"fmt"
+	"regexp"
+)
+
 // TwilioMessage is a base struct for all Websocket events with Twilio.
 type TwilioMessage struct {
 	// Event either of "connected", "start", "media", "stop", "mark" or "clear"
@@ -55,4 +60,19 @@ type TwilioStopPayload struct {
 // TwilioMarkPayload https://www.twilio.com/docs/voice/twiml/stream#message-mark
 type TwilioMarkPayload struct {
 	Name string `json:"name"`
+}
+
+// truncatePayload shortens the "payload" field in a JSON string to the first 100 characters.
+func truncatePayload(jsonStr string) string {
+	re := regexp.MustCompile(`"payload":\s*"(.*?)"`)
+	return re.ReplaceAllStringFunc(jsonStr, func(m string) string {
+		matches := re.FindStringSubmatch(m)
+		if len(matches) > 1 {
+			payload := matches[1]
+			if len(payload) > 100 {
+				return fmt.Sprintf(`"payload": "%.100s ... (truncated)"`, payload)
+			}
+		}
+		return m
+	})
 }

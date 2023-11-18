@@ -2,9 +2,9 @@ package networking
 
 import (
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"net/http"
-	"runtime/debug"
 )
 
 // WebsocketMessageHandler usage:
@@ -74,6 +74,10 @@ func NewWebsocketHandlerFunc(createHandler func() WebsocketMessageHandler) func(
 				if err := ws.WriteMessage(websocket.TextMessage, msg); err != nil {
 					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
 						log.Info().Msg("websocket too late to write message, as already closed")
+					} else if errors.Is(err, websocket.ErrCloseSent) {
+						// ErrCloseSent is returned when the application writes a message to the
+						// connection after sending a close message.
+						log.Info().Msg("websocket too late to write message, as already closed")
 					} else {
 						errLog(err, "ws.WriteMessage")
 					}
@@ -101,7 +105,6 @@ func NewWebsocketHandlerFunc(createHandler func() WebsocketMessageHandler) func(
 
 func errLog(err error, what string) {
 	if err != nil {
-		log.Error().Err(err).Msg(what)
-		debug.PrintStack()
+		log.Error().Err(errors.WithStack(err)).Msg(what)
 	}
 }
