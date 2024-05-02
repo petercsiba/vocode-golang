@@ -1,13 +1,14 @@
 // Package audioio declares audio input/output interface and defines a few common implementations
 // TLDR; Go itself cannot work with Microphone's well
 // BUT it can bind with C-libraries which can do this with a bit of black-magic.
-package audioio
+package main
 
 import (
 	"fmt"
 	"github.com/gen2brain/malgo"
 	"github.com/go-audio/audio"
 	"github.com/petrzlen/vocode-golang/pkg/audio_utils"
+	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/rs/zerolog/log"
 	"os"
 	"strings"
@@ -15,12 +16,6 @@ import (
 
 	"github.com/petrzlen/vocode-golang/pkg/models"
 )
-
-func dbg(err error) {
-	if err != nil {
-		log.Debug().Err(err).Msg("sth non-essential failed")
-	}
-}
 
 const MyDeviceInputChannels uint32 = 1
 const MyDeviceSampleRate uint32 = 44100
@@ -40,7 +35,7 @@ type microphone struct {
 // NewMicrophone inits the microphone device,
 // you should defer StopRecording
 // TODO(P0, devx): We should add a Cleanup method, and make the Start / Stop recording to wake / sleep the input device.
-func NewMicrophone() (result InputDevice, err error) {
+func NewMicrophone() (result audioio.InputDevice, err error) {
 	log.Info().Msg("malgo init context (miniaudio)")
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
 		log.Debug().Msg(strings.Replace("malgo devices: "+message, "\n", "", -1))

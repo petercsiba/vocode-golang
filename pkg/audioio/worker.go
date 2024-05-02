@@ -65,3 +65,9 @@ func PlayAudioChunksRoutine(outputDevice OutputDevice, audioDataChan chan models
 	}
 	log.Info().Msgf("playAudioChunksRoutine finished")
 }
+
+func dbg(err error) {
+	if err != nil {
+		log.Debug().Err(err).Msg("sth non-essential failed")
+	}
+}

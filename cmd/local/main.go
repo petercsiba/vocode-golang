@@ -153,7 +153,7 @@ func main() {
 	// We use numChannels = 1, to be consistent across vocode-golang,
 	// although we could have nice stereo output, all of telephony, synthesizer, transcriber really cares only about 1.
 	numChannels := 1
-	audioOutput, err := audioio.NewSpeakers(OpenAiSampleRate, numChannels)
+	audioOutput, err := NewSpeakers(OpenAiSampleRate, numChannels)
 	ftl(err)
 
 	log.Debug().Dur("setup_time", time.Since(setupStart)).Msg("setup done")
@@ -183,7 +183,7 @@ func main() {
 		// finalTranscriptChan := make(chan string, 1)
 		go fillerWordRoutine(chatAgent, tts, earlyTranscriptChan, ttsOutputBuffer)
 
-		audioInput, err := audioio.NewMicrophone() // About 200ms
+		audioInput, err := NewMicrophone() // About 200ms
 		ftl(err)
 		err = audioInput.StartRecording(inputAudioChunksChan)
 		ftl(err)

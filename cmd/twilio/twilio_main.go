@@ -1,3 +1,22 @@
+/*
+To live test it:
+flyctl deploy
+flyctl launch
+ngrok http 8081
+# take the printed url s/https/wss and update the Twiml config (if not already)
+# https://console.twilio.com/us1/develop/phone-numbers/manage/incoming
+# <?xml version="1.0" encoding="UTF-8"?>
+# <Response>
+#    <Connect>
+#        <!-- <Stream url="wss://vocode-golang.fly.dev/ws" /> -->
+#      	<Stream url="wss://7e98-24-130-57-37.ngrok-free.app/ws" />
+#    </Connect>
+# </Response>
+go run cmd/twilio/twilio_main.go
+
+# websocat wss://vocode-golang.fly.dev/ws
+# call your Twilio number
+*/
 package main
 
 import (
@@ -19,6 +38,7 @@ import (
 
 func submitChatPromptRoutine(chatAgent agent.ChatAgent, transcribedTextChan chan models.AudioData, allChatOutputChan chan string) {
 	var fullConvo models.Conversation
+	fullConvo.Add("assistant", "You are an agent on a phone call, be concise.")
 
 	chatPrompt := ""
 	for inputTextChunk := range transcribedTextChan {
@@ -79,6 +99,7 @@ func main() {
 		earlyTranscriptChan := make(chan string, 10)
 
 		allChatOutputChan := make(chan string, 100000)
+		allChatOutputChan <- "Hi this is Voxana AMA, ask me anything."
 		audioToPlayChan := make(chan models.AudioData) // non-buffer
 
 		go transcriber.TranscribeAudioRoutine(whisper, inputAudioChunksChan, inputTextChunksChan, earlyTranscriptChan)
@@ -94,8 +115,14 @@ func main() {
 		return handler
 	}
 
+	// For fly.io
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8081"
+	}
+
 	http.HandleFunc("/ws", networking.NewWebsocketHandlerFunc(twilioHandlerFactory))
-	ftl(http.ListenAndServe(":8081", nil))
+	ftl(http.ListenAndServe(":"+port, nil))
 }
 
 func ftl(err error) {

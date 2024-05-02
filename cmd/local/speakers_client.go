@@ -1,4 +1,6 @@
-package audioio
+//go:build local
+
+package main
 
 import (
 	"bytes"
@@ -6,6 +8,7 @@ import (
 	"github.com/ebitengine/oto/v3"
 	"github.com/go-audio/audio"
 	"github.com/petrzlen/vocode-golang/pkg/audio_utils"
+	"github.com/petrzlen/vocode-golang/pkg/audioio"
 	"github.com/rs/zerolog/log"
 	"os"
 	"sync"
@@ -38,7 +41,7 @@ type speakers struct {
 	fileCount int
 }
 
-func NewSpeakers(sampleRate int, numChannels int) (OutputDevice, error) {
+func NewSpeakers(sampleRate int, numChannels int) (audioio.OutputDevice, error) {
 	op := &oto.NewContextOptions{
 		SampleRate:   sampleRate,
 		ChannelCount: numChannels,
