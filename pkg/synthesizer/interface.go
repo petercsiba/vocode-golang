@@ -1,3 +1,4 @@
+// TODO(P1, ux): Try implementing PlayHT which seems to have superior voice: https://play.ht/" 
 package synthesizer
 
 import "github.com/petrzlen/vocode-golang/pkg/models"
